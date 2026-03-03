@@ -103,6 +103,13 @@ struct SessionManifest: Decodable {
 }
 
 final class ScoutProcessController {
+    struct DiagnosticsSnapshot {
+        let queueCount: Int
+        let queuedPathsCount: Int
+        let observationsCount: Int
+        let processedThisRunCount: Int
+    }
+
     struct SessionArchiveMetadata {
         let orgNameResolved: String
         let folderId: String
@@ -195,6 +202,17 @@ final class ScoutProcessController {
         guard enqueued else { return }
         log("Detected: \(url.lastPathComponent) (event: created)")
         updateQueue(url.lastPathComponent, status: .pending, detail: "Queued from drag and drop")
+    }
+
+    func diagnosticsSnapshot() -> DiagnosticsSnapshot {
+        withStateLock {
+            DiagnosticsSnapshot(
+                queueCount: queue.count,
+                queuedPathsCount: queuedPaths.count,
+                observationsCount: observations.count,
+                processedThisRunCount: processedThisRun.count
+            )
+        }
     }
 
     private func createDirectoriesIfNeeded() {

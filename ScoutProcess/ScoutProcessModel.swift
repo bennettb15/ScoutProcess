@@ -100,6 +100,7 @@ final class ScoutProcessModel {
     private let failedMonitorQueue = DispatchQueue(label: "com.bennett.scoutprocess.failed-monitor", qos: .utility)
     private var failedDirectoryFileDescriptor: CInt = -1
     private var failedDirectoryMonitor: DispatchSourceFileSystemObject?
+    private var memoryLogTimer: DispatchSourceTimer?
 
     init() {
         let directories = ScoutProcessDirectories.defaultDirectories()
@@ -138,6 +139,10 @@ final class ScoutProcessModel {
         isWatcherActive = true
         refreshInputItemCount()
         refreshFailedItemCount()
+#if DEBUG
+        logLaunchDiagnostics()
+        startMemoryDiagnostics()
+#endif
         startInputDirectoryMonitor()
         startFailedDirectoryMonitor()
     }
@@ -145,6 +150,9 @@ final class ScoutProcessModel {
     func stop() {
         controller.stop()
         isWatcherActive = false
+#if DEBUG
+        stopMemoryDiagnostics()
+#endif
         stopInputDirectoryMonitor()
         stopFailedDirectoryMonitor()
     }
@@ -383,6 +391,81 @@ final class ScoutProcessModel {
             failedDirectoryFileDescriptor = -1
         }
     }
+
+    #if DEBUG
+    private func startMemoryDiagnostics() {
+        stopMemoryDiagnostics()
+
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now(), repeating: .seconds(5))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let residentBytes = MemoryDiagnostics.currentResidentSizeBytes()
+            print("[Diagnostics] resident=\(MemoryDiagnostics.formatBytes(residentBytes)) (\(residentBytes) bytes)")
+            Task { @MainActor [weak self] in
+                self?.logRuntimeCounts()
+            }
+        }
+        memoryLogTimer = timer
+        timer.resume()
+    }
+
+    private func stopMemoryDiagnostics() {
+        memoryLogTimer?.cancel()
+        memoryLogTimer = nil
+    }
+
+    private func logLaunchDiagnostics() {
+        let inputCount = countItems(in: directories.input)
+        let workingCount = countItems(in: directories.working)
+        let processedCount = countItems(in: directories.base.appending(path: "Processed", directoryHint: .isDirectory))
+        let failedCount = countItems(in: directories.failed)
+        let sessionCount = countDetectedSessions()
+        let residentBytes = MemoryDiagnostics.currentResidentSizeBytes()
+
+        print("[Diagnostics] launch folders input=\(inputCount) working=\(workingCount) processed=\(processedCount) failed=\(failedCount)")
+        print("[Diagnostics] launch sessions detected=\(sessionCount)")
+        print("[Diagnostics] launch arrays queueItems=\(queueItems.count) logLines=\(logLines.count)")
+
+        let snapshot = controller.diagnosticsSnapshot()
+        print("[Diagnostics] launch controller queuedZips=\(snapshot.queueCount) queuedPaths=\(snapshot.queuedPathsCount) observations=\(snapshot.observationsCount) processedThisRun=\(snapshot.processedThisRunCount)")
+        print("[Diagnostics] launch resident=\(MemoryDiagnostics.formatBytes(residentBytes)) (\(residentBytes) bytes)")
+    }
+
+    private func logRuntimeCounts() {
+        let snapshot = controller.diagnosticsSnapshot()
+        print("[Diagnostics] runtime queueItems=\(queueItems.count) logLines=\(logLines.count) queuedZips=\(snapshot.queueCount) queuedPaths=\(snapshot.queuedPathsCount) observations=\(snapshot.observationsCount) processedThisRun=\(snapshot.processedThisRunCount)")
+    }
+
+    private func countItems(in directory: URL) -> Int {
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+
+        return contents.count
+    }
+
+    private func countDetectedSessions() -> Int {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directories.archiveRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+
+        var count = 0
+        for case let url as URL in enumerator {
+            guard url.lastPathComponent == "session.json" else { continue }
+            count += 1
+        }
+        return count
+    }
+    #endif
 
     static var preview: ScoutProcessModel {
         let model = ScoutProcessModel()
