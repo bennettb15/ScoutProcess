@@ -9,9 +9,18 @@ import SwiftUI
 
 @main
 struct ScoutProcessApp: App {
+    @State private var model = ScoutProcessModel()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environment(model)
+                .task {
+                    model.start()
+                }
+                .onDisappear {
+                    model.stop()
+                }
         }
     }
 }
