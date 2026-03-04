@@ -4,8 +4,10 @@
 //
 
 import AppKit
+import CryptoKit
 import CoreGraphics
 import Foundation
+import GRDB
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -14,6 +16,7 @@ struct ScoutProcessDirectories {
     let input: URL
     let working: URL
     let failed: URL
+    let duplicate: URL
     let archiveRoot: URL
     let clientsRoot: URL
 
@@ -27,6 +30,7 @@ struct ScoutProcessDirectories {
             input: base.appending(path: "Input", directoryHint: .isDirectory),
             working: base.appending(path: "Working", directoryHint: .isDirectory),
             failed: base.appending(path: "Failed", directoryHint: .isDirectory),
+            duplicate: base.appending(path: "Duplicate", directoryHint: .isDirectory),
             archiveRoot: archiveRoot,
             clientsRoot: clientsRoot
         )
@@ -47,6 +51,7 @@ enum ScoutProcessError: LocalizedError {
     case sourceImageMissing(String)
     case invalidImage(String)
     case missingRequiredMetadata(String)
+    case duplicateZIP(String)
 
     var errorDescription: String? {
         switch self {
@@ -57,6 +62,7 @@ enum ScoutProcessError: LocalizedError {
         case .sourceImageMissing(let name): "Source image missing: \(name)"
         case .invalidImage(let name): "Unable to decode image: \(name)"
         case .missingRequiredMetadata(let field): "Missing required metadata: \(field)"
+        case .duplicateZIP(let sessionID): "Duplicate ZIP detected. Already imported as session \(sessionID)."
         }
     }
 }
@@ -80,6 +86,9 @@ struct SessionManifest: Decodable {
     struct Shot: Decodable {
         var originalFilename: String?
         var stampedFilename: String?
+        var shotKey: String?
+        var logicalShotIdentity: String?
+        var shotName: String?
         var building: String?
         var elevation: String?
         var detailType: String?
@@ -152,14 +161,17 @@ final class ScoutProcessController {
     private var observations: [String: FileObservation] = [:]
 
     private let jpegQuality: CGFloat = 0.85
-    private let stabilityInterval: TimeInterval = 2.0
+    private let stabilityInterval: TimeInterval = 0.75
     private let pollIntervalNanoseconds: UInt64 = 1_000_000_000
+    private let enableSessionReportPDF = true
+    private static let supportedStampImageExtensions: Set<String> = ["heic", "jpg", "jpeg", "png"]
 
     private enum ScanAction {
         case none
         case created
         case modified
         case queuedStable
+        case waiting(String)
     }
 
     init(directories: ScoutProcessDirectories) {
@@ -190,7 +202,6 @@ final class ScoutProcessController {
         guard fileManager.fileExists(atPath: url.path) else { return }
 
         let enqueued = withStateLock { () -> Bool in
-            guard processedThisRun.contains(url.lastPathComponent) == false else { return false }
             guard queuedPaths.contains(url.path) == false else { return false }
 
             observations.removeValue(forKey: url.path)
@@ -216,7 +227,7 @@ final class ScoutProcessController {
     }
 
     private func createDirectoriesIfNeeded() {
-        for directory in [directories.base, directories.input, directories.working, directories.failed, directories.archiveRoot, directories.clientsRoot] {
+        for directory in [directories.base, directories.input, directories.working, directories.failed, directories.duplicate, directories.archiveRoot, directories.clientsRoot] {
             do {
                 try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
             } catch {
@@ -299,40 +310,55 @@ final class ScoutProcessController {
             let modifiedAt = values?.contentModificationDate ?? now
 
             let action = withStateLock { () -> ScanAction in
-                guard processedThisRun.contains(url.lastPathComponent) == false else { return .none }
                 guard queuedPaths.contains(url.path) == false else { return .none }
 
                 if let observation = observations[url.path] {
-                    if observation.lastSize == size,
-                       now.timeIntervalSince(observation.stableSince) >= stabilityInterval,
+                    if observation.lastSize != size || observation.lastModifiedAt != modifiedAt {
+                        observations[url.path] = FileObservation(
+                            firstDetectedAt: observation.firstDetectedAt,
+                            lastSize: size,
+                            lastModifiedAt: modifiedAt,
+                            stableSince: now
+                        )
+                        return .waiting("ZIP not ready, size changing")
+                    }
+
+                    if now.timeIntervalSince(observation.stableSince) >= stabilityInterval,
                        now.timeIntervalSince(modifiedAt) >= stabilityInterval {
+                        guard isZIPReadable(at: url) else {
+                            return .waiting("ZIP not ready, file not readable")
+                        }
                         queue.append(url)
                         queuedPaths.insert(url.path)
                         observations.removeValue(forKey: url.path)
                         return .queuedStable
                     }
 
-                    if observation.lastSize != size || observation.lastModifiedAt != modifiedAt {
-                        observations[url.path] = FileObservation(lastSize: size, lastModifiedAt: modifiedAt, stableSince: now)
-                        return .modified
-                    }
-
                     observations[url.path] = observation
                     return .none
                 }
 
-                observations[url.path] = FileObservation(lastSize: size, lastModifiedAt: modifiedAt, stableSince: now)
+                observations[url.path] = FileObservation(
+                    firstDetectedAt: now,
+                    lastSize: size,
+                    lastModifiedAt: modifiedAt,
+                    stableSince: now
+                )
                 return .created
             }
 
             switch action {
             case .created:
-                log("Detected: \(url.lastPathComponent) (event: created)")
+                log("Timing zip-detected file=\(url.lastPathComponent) elapsed_ms=0")
+                log("Timing readiness-start file=\(url.lastPathComponent) elapsed_ms=0")
             case .modified:
                 log("Detected: \(url.lastPathComponent) (event: modified)")
             case .queuedStable:
                 updateQueue(url.lastPathComponent, status: .pending, detail: "Queued for processing")
+                log("Timing readiness-end file=\(url.lastPathComponent) elapsed_ms=\(millisecondsSince(firstDetectedAt(for: url.path), now: now))")
                 log("Detected stable ZIP \(url.lastPathComponent)")
+            case .waiting(let reason):
+                log("Timing readiness-wait file=\(url.lastPathComponent) elapsed_ms=\(millisecondsSince(firstDetectedAt(for: url.path), now: now)) reason=\(reason)")
             case .none:
                 break
             }
@@ -346,17 +372,11 @@ final class ScoutProcessController {
 
         do {
             let result = try await runPipelineAsync(zipURL: zipURL)
-            _ = withStateLock {
-                processedThisRun.insert(zipURL.lastPathComponent)
-            }
             onLastProcessed?(Date())
             log("Completed \(zipURL.lastPathComponent) -> \(result.processedFolder.lastPathComponent)")
             updateQueue(zipURL.lastPathComponent, status: .done, detail: "Archived", destinationURL: result.processedFolder)
             onStateChange?(.idle)
         } catch {
-            _ = withStateLock {
-                processedThisRun.insert(zipURL.lastPathComponent)
-            }
             log("Failed \(zipURL.lastPathComponent): \(error.localizedDescription)")
             updateQueue(zipURL.lastPathComponent, status: .failed, detail: error.localizedDescription)
             onStateChange?(.error)
@@ -381,14 +401,25 @@ final class ScoutProcessController {
     }
 
     private func runPipeline(zipURL: URL) throws -> PipelineResult {
+        let moveStartedAt = Date()
+        log("Timing move-start file=\(zipURL.lastPathComponent) elapsed_ms=0")
         let workingZipURL = try moveZipIntoWorking(zipURL)
+        logTiming("move-end", startedAt: moveStartedAt, detail: "file=\(zipURL.lastPathComponent) path=\(workingZipURL.path(percentEncoded: false))")
+
+        let fingerprintStartedAt = Date()
+        log("Timing fingerprint-start file=\(workingZipURL.lastPathComponent) elapsed_ms=0")
+        let zipFingerprint = try fingerprint(for: workingZipURL)
+        logTiming("fingerprint-end", startedAt: fingerprintStartedAt, detail: "file=\(workingZipURL.lastPathComponent)")
         let sessionFolder = workingSessionFolderURL(for: workingZipURL)
         var processedCount = 0
         var lastStep = "initializing"
 
         do {
             lastStep = "unzipping archive"
+            let extractionStartedAt = Date()
+            log("Timing extraction-start file=\(workingZipURL.lastPathComponent) elapsed_ms=0")
             try unzip(zipURL: workingZipURL, destination: sessionFolder)
+            logTiming("extraction-end", startedAt: extractionStartedAt, detail: "file=\(workingZipURL.lastPathComponent)")
             log("Unzipped into \(sessionFolder.lastPathComponent)")
 
             lastStep = "validating contents"
@@ -397,8 +428,29 @@ final class ScoutProcessController {
             let originalsURL = resolvedSessionFolder.appending(path: "Originals", directoryHint: .isDirectory)
 
             let manifest = try loadManifest(at: sessionJSONURL)
-            let issueLookup = buildIssueLookup(from: manifest.issues ?? [])
             let archiveMetadata = try extractArchiveMetadata(from: manifest)
+
+            let importResult: CSVImportSessionResult
+            do {
+                importResult = try CSVImportService.shared.importSessionFolder(
+                    at: resolvedSessionFolder,
+                    zipName: workingZipURL.lastPathComponent,
+                    zipFingerprint: zipFingerprint
+                )
+            } catch {
+                log("CSV import failed for \(resolvedSessionFolder.lastPathComponent): \(error.localizedDescription)")
+                throw error
+            }
+
+            if let duplicateSessionID = importResult.duplicateSessionID {
+                let duplicateZipURL = uniqueDestinationURL(in: directories.duplicate, preferredName: workingZipURL.lastPathComponent)
+                try moveReplacingIfNeeded(from: workingZipURL, to: duplicateZipURL)
+                if fileManager.fileExists(atPath: sessionFolder.path) {
+                    try? fileManager.removeItem(at: sessionFolder)
+                }
+                log("Duplicate ZIP detected. Already imported as session \(duplicateSessionID).")
+                throw ScoutProcessError.duplicateZIP(duplicateSessionID)
+            }
 
             try writeValidationFile(at: resolvedSessionFolder, manifest: manifest)
 
@@ -406,26 +458,62 @@ final class ScoutProcessController {
             let stampedURL = resolvedSessionFolder.appending(path: "Stamped", directoryHint: .isDirectory)
             try fileManager.createDirectory(at: stampedURL, withIntermediateDirectories: true)
             log("Rendering \(manifest.shots.count) stamped JPGs")
+            let sourceCatalog = buildSourceImageCatalog(in: originalsURL)
+            var stampingErrors: [String] = []
+            var usedOutputNames: Set<String> = []
 
             for (index, shot) in manifest.shots.enumerated() {
-                let sourceName = shot.originalFilename ?? ""
+                let sourceName = shot.originalFilename?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let detectedAsImage = isSupportedStampImageFileName(sourceName)
+
                 guard !sourceName.isEmpty else {
-                    throw ScoutProcessError.sourceImageMissing("Shot \(index + 1) originalFilename is empty")
-                }
-                let sourceURL = originalsURL.appending(path: sourceName)
-                guard fileManager.fileExists(atPath: sourceURL.path) else {
-                    throw ScoutProcessError.sourceImageMissing(sourceName)
+                    let message = "Stamp input: source=<missing> detectedAsImage=false generated=false output=<none> error=Shot \(index + 1) originalFilename is empty"
+                    log(message)
+                    stampingErrors.append(message)
+                    continue
                 }
 
-                let stampedName = makeStampedFilename(for: shot, session: manifest)
-                let destinationURL = stampedURL.appending(path: stampedName)
-                try stampImage(
+                guard let sourceURL = resolveSourceImageURL(named: sourceName, in: sourceCatalog) else {
+                    let message = "Stamp input: source=\(originalsURL.appending(path: sourceName).path(percentEncoded: false)) detectedAsImage=\(detectedAsImage) generated=false output=<none> error=Source image missing"
+                    log(message)
+                    stampingErrors.append(message)
+                    continue
+                }
+
+                let stampedName = uniqueStampedFilename(
+                    preferredName: makeStampedFilename(for: shot, session: manifest),
                     sourceURL: sourceURL,
-                    destinationURL: destinationURL,
-                    overlay: makeOverlayLines(for: shot, session: manifest, issues: issueLookup)
+                    usedNames: &usedOutputNames
                 )
-                processedCount += 1
+                let destinationURL = stampedURL.appending(path: stampedName)
+                let replacedExisting = fileManager.fileExists(atPath: destinationURL.path)
+
+                do {
+                    let isFlagged = shot.isFlagged == true
+                    try stampImage(
+                        sourceURL: sourceURL,
+                        destinationURL: destinationURL,
+                        stampText: makeStampText(for: shot, session: manifest),
+                        isFlagged: isFlagged
+                    )
+                    try validateStampedOutput(at: destinationURL)
+                    try updateShotAssetMetadata(
+                        sessionID: importResult.sessionID,
+                        shot: shot,
+                        session: manifest,
+                        stampedFilename: stampedName
+                    )
+                    processedCount += 1
+                    log("Stamp input: source=\(sourceURL.path(percentEncoded: false)) detectedAsImage=\(detectedAsImage) generated=true output=\(destinationURL.path(percentEncoded: false)) flagged=\(isFlagged) borderApplied=false replaced=\(replacedExisting) error=<none>")
+                    log("Stamped image created: \(stampedName) | flagged=\(isFlagged) | border not applied")
+                } catch {
+                    let message = "Stamp input: source=\(sourceURL.path(percentEncoded: false)) detectedAsImage=\(detectedAsImage) generated=false output=\(destinationURL.path(percentEncoded: false)) flagged=\(shot.isFlagged == true) borderApplied=false error=\(error.localizedDescription)"
+                    log(message)
+                    stampingErrors.append(message)
+                }
             }
+
+            log("Stamp summary: requested=\(manifest.shots.count) generated=\(processedCount) failed=\(stampingErrors.count)")
 
             lastStep = "routing archived session"
             let archivedSessionURL = try archiveSessionFolder(
@@ -433,12 +521,35 @@ final class ScoutProcessController {
                 metadata: archiveMetadata
             )
 
+            if enableSessionReportPDF {
+                if let importedSessionID = importResult.sessionID {
+                    do {
+                        let pdfURL = try PDFSessionReportGenerator().generateSessionReport(
+                            sessionID: importedSessionID,
+                            extractedFolderURL: archivedSessionURL,
+                            zipName: workingZipURL.lastPathComponent
+                        )
+                        log("SessionReport.pdf created at \(pdfURL.path(percentEncoded: false))")
+                    } catch {
+                        log("Session report generation failed for session \(importedSessionID): \(error.localizedDescription)")
+                    }
+                } else {
+                    log("Session report generation skipped: imported session ID was unavailable.")
+                }
+            }
+
             if sessionFolder != resolvedSessionFolder, fileManager.fileExists(atPath: sessionFolder.path) {
                 try? fileManager.removeItem(at: sessionFolder)
             }
 
             try fileManager.removeItem(at: workingZipURL)
             log("Deleted processed ZIP \(workingZipURL.lastPathComponent)")
+            if let qualitySummary = importResult.qualitySummary {
+                log("IMPORT QUALITY SUMMARY")
+                log(
+                    "sessions=\(qualitySummary.rowsSessions) shots=\(qualitySummary.rowsShots) guided_rows=\(qualitySummary.rowsGuidedRows) issues=\(qualitySummary.rowsIssues) issue_history_upserted=\(qualitySummary.rowsIssueHistory) issue_history_parsed=\(qualitySummary.issueHistoryParsedRows) issue_history_skippedMalformed=\(qualitySummary.issueHistorySkippedMalformedRows) issue_history_skippedOrphan=\(qualitySummary.issueHistorySkippedOrphanRows)"
+                )
+            }
 
             return PipelineResult(processedFolder: archivedSessionURL)
         } catch {
@@ -477,6 +588,30 @@ final class ScoutProcessController {
         stateLock.lock()
         defer { stateLock.unlock() }
         return body()
+    }
+
+    private func firstDetectedAt(for path: String) -> Date {
+        withStateLock {
+            observations[path]?.firstDetectedAt ?? Date()
+        }
+    }
+
+    private func isZIPReadable(at url: URL) -> Bool {
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            try handle.close()
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func millisecondsSince(_ startedAt: Date, now: Date = Date()) -> Int {
+        Int(now.timeIntervalSince(startedAt) * 1000)
+    }
+
+    private func logTiming(_ step: String, startedAt: Date, detail: String) {
+        log("Timing \(step) \(detail) elapsed_ms=\(millisecondsSince(startedAt))")
     }
 
     private func moveZipIntoWorking(_ zipURL: URL) throws -> URL {
@@ -720,69 +855,29 @@ final class ScoutProcessController {
         return lookup
     }
 
-    private func makeOverlayLines(
-        for shot: SessionManifest.Shot,
-        session: SessionManifest,
-        issues: [String: String]
-    ) -> [String] {
-        let propertyName = shot.propertyName ?? session.propertyNameAtCapture ?? session.propertyName ?? "Property"
-        let building = shot.building ?? session.building ?? "Building"
-        let elevation = shot.elevation ?? session.elevation ?? "Elevation"
-        let detailType = shot.detailType ?? session.detailType ?? "Detail"
-        let angleIndex = shot.angleIndex ?? 0
-
-        var lines = [
-            propertyName,
-            "\(building) | \(elevation) | \(detailType) | Angle \(angleIndex)",
-            formatLocalTimestamp(shot.capturedAtLocal)
-        ]
-
-        if shot.isFlagged == true {
-            let issueKey = shot.issueID ?? shot.issueId
-            if let explicitReason = shot.currentReason, !explicitReason.isEmpty {
-                lines.append("Note: \(explicitReason)")
-            } else if let issueKey, let reason = issues[issueKey] {
-                lines.append("Note: \(reason)")
-            } else {
-                lines.append("Note")
-            }
-        }
-
-        return lines
+    private func makeStampText(for shot: SessionManifest.Shot, session: SessionManifest) -> String {
+        let fields = ScoutShotNaming.stampFields(
+            elevationCode: shot.building ?? session.building,
+            angle: shot.elevation ?? session.elevation,
+            shotName: shot.shotName ?? shot.detailType ?? session.detailType,
+            shotKey: shot.shotKey,
+            angleIndex: shot.angleIndex,
+            capturedAt: shot.capturedAtLocal,
+            formatter: { [self] in formatLocalDate($0) }
+        )
+        return "\(fields.elevation) | \(fields.angle) | \(fields.shotName) | \(fields.detailID) • \(fields.dateTime)".uppercased()
     }
 
     private func makeStampedFilename(for shot: SessionManifest.Shot, session: SessionManifest) -> String {
-        if let stampedFilename = shot.stampedFilename, !stampedFilename.isEmpty {
-            let normalizedName = stampedFilename.lowercased().hasSuffix(".jpg") ? stampedFilename : "\(stampedFilename).jpg"
-            return shot.isFlagged == true ? appendFlaggedSuffix(to: normalizedName) : normalizedName
-        }
-
-        let building = sanitize(shot.building ?? session.building ?? "Building")
-        let elevation = sanitize(shot.elevation ?? session.elevation ?? "Elevation")
-        let detailType = sanitize(shot.detailType ?? session.detailType ?? "Detail")
-        let angle = shot.angleIndex ?? 0
-        let timestamp = fallbackFileTimestamp(from: shot.capturedAtLocal)
-        let baseName = "\(building)_\(elevation)_\(detailType)_A\(angle)_\(timestamp).jpg"
-        return shot.isFlagged == true ? appendFlaggedSuffix(to: baseName) : baseName
-    }
-
-    private func appendFlaggedSuffix(to fileName: String) -> String {
-        let url = URL(fileURLWithPath: fileName)
-        let ext = url.pathExtension
-        let baseName = url.deletingPathExtension().lastPathComponent
-
-        guard baseName.hasSuffix("_Flagged") == false else {
-            return fileName
-        }
-
-        return ext.isEmpty ? "\(baseName)_Flagged" : "\(baseName)_Flagged.\(ext)"
-    }
-
-    private func fallbackFileTimestamp(from capturedAtLocal: String?) -> String {
-        guard let capturedAtLocal, let date = Self.inputDateFormatter.date(from: capturedAtLocal) ?? Self.isoDateFormatter.date(from: capturedAtLocal) else {
-            return Self.fileDateFormatter.string(from: Date())
-        }
-        return Self.fileDateFormatter.string(from: date)
+        ScoutShotNaming.stampedJPEGFilename(
+            building: shot.building ?? session.building,
+            elevation: shot.elevation ?? session.elevation,
+            detailType: shot.detailType ?? session.detailType,
+            angleIndex: shot.angleIndex,
+            shotKey: shot.shotKey,
+            shotName: shot.shotName,
+            isFlagged: shot.isFlagged == true
+        )
     }
 
     private func formatLocalTimestamp(_ rawValue: String?) -> String {
@@ -797,103 +892,118 @@ final class ScoutProcessController {
         return rawValue
     }
 
-    private func stampImage(sourceURL: URL, destinationURL: URL, overlay: [String]) throws {
-        guard let original = NSImage(contentsOf: sourceURL) else {
+    private func formatLocalDate(_ rawValue: String?) -> String {
+        guard let rawValue else {
+            return Self.overlayDateOnlyFormatter.string(from: Date())
+        }
+
+        if let date = Self.inputDateFormatter.date(from: rawValue) ?? Self.isoDateFormatter.date(from: rawValue) {
+            return Self.overlayDateOnlyFormatter.string(from: date)
+        }
+
+        return rawValue
+    }
+
+    private func stampImage(sourceURL: URL, destinationURL: URL, stampText: String, isFlagged: Bool) throws {
+        guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+              let original = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw ScoutProcessError.invalidImage(sourceURL.lastPathComponent)
         }
 
-        let size = original.size
+        let size = CGSize(width: original.width, height: original.height)
         guard size.width > 0, size.height > 0 else {
             throw ScoutProcessError.invalidImage(sourceURL.lastPathComponent)
         }
 
-        let rendered = NSImage(size: size)
-        rendered.lockFocus()
+        let colorSpace = original.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: original.width,
+            height: original.height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw ScoutProcessError.invalidImage(sourceURL.lastPathComponent)
+        }
 
-        original.draw(in: NSRect(origin: .zero, size: size))
+        context.setAllowsAntialiasing(true)
+        context.interpolationQuality = .high
+
+        let drawRect = CGRect(origin: .zero, size: size)
+        context.draw(original, in: drawRect)
 
         let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .left
+        paragraph.alignment = .center
         paragraph.lineBreakMode = .byTruncatingTail
 
-        let primaryFontSize = max(34, min(66, size.width * 0.034))
-        let secondaryFontSize = max(28, min(54, size.width * 0.027))
-        let issueFontSize = max(26, min(50, size.width * 0.026))
+        let isPortrait = size.height > size.width
+        let fontSize: CGFloat = isPortrait ? 56 : 48
+        let pillHeight: CGFloat = isPortrait ? 108 : 96
+        let horizontalPadding: CGFloat = isPortrait ? 36 : 32
+        let verticalPadding: CGFloat = isPortrait ? 22 : 20
+        let bottomMargin: CGFloat = isPortrait ? 40 : 36
+        let sideMargin: CGFloat = isPortrait ? 40 : 36
+        let cornerRadius: CGFloat = isPortrait ? 22 : 20
+        let maxOverlayWidth = size.width - (sideMargin * 2)
+        let glyphGap: CGFloat = isFlagged ? 14 : 0
+        let textAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold),
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: paragraph,
+        ]
+        let glyphImage = isFlagged ? makeFlagGlyphImage(fontSize: fontSize) : nil
+        let glyphSize = glyphImage?.size ?? .zero
 
-        let lineAttributes: [[NSAttributedString.Key: Any]] = overlay.enumerated().map { index, _ in
-            let font: NSFont
-            if index == 0 {
-                font = NSFont.systemFont(ofSize: primaryFontSize, weight: .bold)
-            } else if index == overlay.count - 1, overlay.count == 4 {
-                font = NSFont.systemFont(ofSize: issueFontSize, weight: .semibold)
-            } else {
-                font = NSFont.systemFont(ofSize: secondaryFontSize, weight: .semibold)
-            }
-
-            return [
-                .font: font,
-                .foregroundColor: NSColor.white,
-                .paragraphStyle: paragraph
-            ]
-        }
-
-        let horizontalPadding = max(24, size.width * 0.026)
-        let verticalPadding = max(18, size.height * 0.015)
-        let interLineSpacing = max(8, size.height * 0.004)
-        let bottomMargin = max(22, size.height * 0.02)
-
-        var measuredRects: [NSRect] = []
-        var textBlockWidth: CGFloat = 0
-        var textBlockHeight: CGFloat = 0
-
-        for (index, line) in overlay.enumerated() {
-            let rect = (line as NSString).boundingRect(
-                with: NSSize(width: size.width * 0.82, height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: lineAttributes[index]
-            ).integral
-            measuredRects.append(rect)
-            textBlockWidth = max(textBlockWidth, rect.width)
-            textBlockHeight += rect.height
-            if index < overlay.count - 1 {
-                textBlockHeight += interLineSpacing
-            }
-        }
-
-        let backgroundRect = NSRect(
-            x: horizontalPadding,
-            y: bottomMargin,
-            width: min(size.width - (horizontalPadding * 2), textBlockWidth + (horizontalPadding * 0.95)),
-            height: textBlockHeight + (verticalPadding * 2)
+        let resolvedStampText = fittedStampText(
+            stampText,
+            maxTextWidth: maxOverlayWidth - (horizontalPadding * 2) - glyphSize.width - glyphGap,
+            attributes: textAttributes
+        )
+        let measuredText = (resolvedStampText as NSString).size(withAttributes: textAttributes)
+        let pillWidth = min(maxOverlayWidth, measuredText.width + (horizontalPadding * 2) + glyphSize.width + glyphGap)
+        let pillRect = CGRect(
+            x: drawRect.maxX - sideMargin - pillWidth,
+            y: drawRect.minY + bottomMargin,
+            width: pillWidth,
+            height: pillHeight
         )
 
-        let cornerRadius = max(22, min(34, size.width * 0.016))
-        let backgroundPath = NSBezierPath(roundedRect: backgroundRect, xRadius: cornerRadius, yRadius: cornerRadius)
-        NSColor.black.withAlphaComponent(0.68).setFill()
+        context.saveGState()
+        let graphicsContext = NSGraphicsContext(cgContext: context, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+
+        let backgroundPath = NSBezierPath(roundedRect: pillRect, xRadius: cornerRadius, yRadius: cornerRadius)
+        NSColor.black.withAlphaComponent(0.42).setFill()
         backgroundPath.fill()
 
-        var currentY = backgroundRect.maxY - verticalPadding
-        let textX = backgroundRect.minX + (horizontalPadding * 0.5)
-
-        for (index, line) in overlay.enumerated() {
-            let rect = measuredRects[index]
-            currentY -= rect.height
-            let textRect = NSRect(
-                x: textX,
-                y: currentY,
-                width: backgroundRect.width - (horizontalPadding * 0.7),
-                height: rect.height + 4
+        var textStartX = pillRect.minX + horizontalPadding
+        if let glyphImage {
+            let glyphRect = CGRect(
+                x: textStartX,
+                y: pillRect.minY + max(0, (pillRect.height - glyphSize.height) / 2) - 1,
+                width: glyphSize.width,
+                height: glyphSize.height
             )
-            (line as NSString).draw(in: textRect, withAttributes: lineAttributes[index])
-            currentY -= interLineSpacing
+            glyphImage.draw(in: glyphRect)
+            textStartX += glyphSize.width + glyphGap
         }
 
-        rendered.unlockFocus()
+        let textRect = CGRect(
+            x: textStartX,
+            y: pillRect.minY + max(0, (pillRect.height - measuredText.height) / 2) - 1,
+            width: pillRect.maxX - horizontalPadding - textStartX,
+            height: pillRect.height - (verticalPadding * 2)
+        )
+        (resolvedStampText as NSString).draw(in: textRect, withAttributes: textAttributes)
 
-        guard let tiff = rendered.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let cgImage = rep.cgImage else {
-            throw ScoutProcessError.invalidImage(sourceURL.lastPathComponent)
+        NSGraphicsContext.restoreGraphicsState()
+        context.restoreGState()
+
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            try fileManager.removeItem(at: destinationURL)
         }
 
         guard let destination = CGImageDestinationCreateWithURL(
@@ -908,8 +1018,125 @@ final class ScoutProcessController {
         let properties: [CFString: Any] = [
             kCGImageDestinationLossyCompressionQuality: jpegQuality
         ]
-        CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
-        CGImageDestinationFinalize(destination)
+        guard let renderedImage = context.makeImage() else {
+            throw ScoutProcessError.invalidImage(sourceURL.lastPathComponent)
+        }
+
+        CGImageDestinationAddImage(destination, renderedImage, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            throw ScoutProcessError.invalidImage(destinationURL.lastPathComponent)
+        }
+    }
+
+    private func fittedStampText(
+        _ stampText: String,
+        maxTextWidth: CGFloat,
+        attributes: [NSAttributedString.Key: Any]
+    ) -> String {
+        if (stampText as NSString).size(withAttributes: attributes).width <= maxTextWidth {
+            return stampText
+        }
+
+        let majorParts = stampText.components(separatedBy: " | ")
+        guard majorParts.count == 4 else { return stampText }
+
+        let tailParts = majorParts[3].components(separatedBy: " • ")
+        guard tailParts.count == 2 else { return stampText }
+
+        let prefix = "\(majorParts[0]) | \(majorParts[1]) | "
+        let detailAndDate = " | \(tailParts[0]) • \(tailParts[1])"
+        var shotName = majorParts[2]
+        let minCharacters = 4
+
+        while shotName.count > minCharacters {
+            shotName.removeLast()
+            let candidate = "\(prefix)\(shotName)...\(detailAndDate)"
+            if (candidate as NSString).size(withAttributes: attributes).width <= maxTextWidth {
+                return candidate
+            }
+        }
+
+        return "\(prefix)...\(detailAndDate)"
+    }
+
+    private func makeFlagGlyphImage(fontSize: CGFloat) -> NSImage? {
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: fontSize * 0.82, weight: .bold)
+        guard let symbolImage = NSImage(systemSymbolName: "flag.fill", accessibilityDescription: "Flagged")?
+            .withSymbolConfiguration(symbolConfig) else {
+            return nil
+        }
+
+        let tintedImage = symbolImage.copy() as? NSImage ?? symbolImage
+        tintedImage.lockFocus()
+        NSColor(calibratedRed: 0.827, green: 0.184, blue: 0.184, alpha: 1.0).set()
+        NSRect(origin: .zero, size: tintedImage.size).fill(using: .sourceAtop)
+        tintedImage.unlockFocus()
+        return tintedImage
+    }
+
+    private func buildSourceImageCatalog(in originalsURL: URL) -> [String: [URL]] {
+        guard let enumerator = fileManager.enumerator(
+            at: originalsURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return [:]
+        }
+
+        var catalog: [String: [URL]] = [:]
+        for case let fileURL as URL in enumerator {
+            guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+            guard isSupportedStampImageFileName(fileURL.lastPathComponent) else { continue }
+            catalog[fileURL.lastPathComponent.lowercased(), default: []].append(fileURL)
+        }
+        return catalog
+    }
+
+    private func resolveSourceImageURL(named sourceName: String, in catalog: [String: [URL]]) -> URL? {
+        let matches = catalog[sourceName.lowercased()] ?? []
+        return matches.sorted { lhs, rhs in
+            lhs.path.count < rhs.path.count
+        }.first
+    }
+
+    private func isSupportedStampImageFileName(_ fileName: String) -> Bool {
+        let pathExtension = URL(fileURLWithPath: fileName).pathExtension.lowercased()
+        return Self.supportedStampImageExtensions.contains(pathExtension)
+    }
+
+    private func uniqueStampedFilename(preferredName: String, sourceURL _: URL, usedNames: inout Set<String>) -> String {
+        let preferredLower = preferredName.lowercased()
+        guard usedNames.contains(preferredLower) else {
+            usedNames.insert(preferredLower)
+            return preferredName
+        }
+
+        let baseURL = URL(fileURLWithPath: preferredName)
+        let baseName = baseURL.deletingPathExtension().lastPathComponent
+        let ext = baseURL.pathExtension.isEmpty ? "jpg" : baseURL.pathExtension
+        for index in 2...999 {
+            let indexedCandidate = "\(baseName)_\(index).\(ext)"
+            let indexedLower = indexedCandidate.lowercased()
+            if usedNames.contains(indexedLower) == false {
+                usedNames.insert(indexedLower)
+                log("Stamp output collision detected. Using \(indexedCandidate) instead of \(preferredName).")
+                return indexedCandidate
+            }
+        }
+
+        usedNames.insert(preferredLower)
+        return preferredName
+    }
+
+    private func validateStampedOutput(at url: URL) throws {
+        guard fileManager.fileExists(atPath: url.path) else {
+            throw ScoutProcessError.invalidImage(url.lastPathComponent)
+        }
+
+        let fileSize = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
+        guard fileSize > 0 else {
+            throw ScoutProcessError.invalidImage(url.lastPathComponent)
+        }
     }
 
     private func uniqueDestinationURL(in parent: URL, preferredName: String) -> URL {
@@ -973,9 +1200,81 @@ final class ScoutProcessController {
 
     private func sanitizeFileNamePreservingExtension(_ value: String) -> String {
         let url = URL(fileURLWithPath: value)
-        let name = sanitize(url.deletingPathExtension().lastPathComponent)
+        let name = ScoutShotNaming.sanitizeComponent(url.deletingPathExtension().lastPathComponent)
         let ext = url.pathExtension
         return ext.isEmpty ? name : "\(name).\(ext)"
+    }
+
+    private func updateShotAssetMetadata(
+        sessionID: String?,
+        shot: SessionManifest.Shot,
+        session: SessionManifest,
+        stampedFilename: String
+    ) throws {
+        guard let sessionID, let dbQueue = DatabaseManager.shared.dbQueue else { return }
+
+        let shotKey = shot.shotKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? shot.shotKey!
+            : "\(shot.detailType ?? session.detailType ?? "Shot") A\(shot.angleIndex ?? 0)"
+        let logicalShotIdentity = shot.logicalShotIdentity?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? shot.logicalShotIdentity!
+            : shotKey
+
+        let flaggedReason = shot.currentReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? shot.currentReason
+            : nil
+
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE shots
+                SET stamped_jpeg_filename = ?,
+                    flagged_reason = COALESCE(?, flagged_reason)
+                WHERE session_id = ? AND logical_shot_identity = ?
+                """,
+                arguments: [stampedFilename, flaggedReason, sessionID, logicalShotIdentity]
+            )
+
+            if db.changesCount == 0, let originalFilename = shot.originalFilename?.trimmingCharacters(in: .whitespacesAndNewlines), originalFilename.isEmpty == false {
+                try db.execute(
+                    sql: """
+                    UPDATE shots
+                    SET stamped_jpeg_filename = ?,
+                        flagged_reason = COALESCE(?, flagged_reason)
+                    WHERE session_id = ? AND original_filename = ?
+                    """,
+                    arguments: [stampedFilename, flaggedReason, sessionID, originalFilename]
+                )
+            }
+
+            if db.changesCount == 0 {
+                try db.execute(
+                    sql: """
+                    UPDATE shots
+                    SET stamped_jpeg_filename = ?,
+                        flagged_reason = COALESCE(?, flagged_reason)
+                    WHERE session_id = ? AND shot_key = ?
+                    """,
+                    arguments: [stampedFilename, flaggedReason, sessionID, shotKey]
+                )
+            }
+        }
+    }
+
+    private func fingerprint(for url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        while true {
+            let data = try handle.read(upToCount: 1_048_576) ?? Data()
+            if data.isEmpty {
+                break
+            }
+            hasher.update(data: data)
+        }
+
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private struct PipelineResult {
@@ -983,6 +1282,7 @@ final class ScoutProcessController {
     }
 
     private struct FileObservation {
+        let firstDetectedAt: Date
         let lastSize: Int
         let lastModifiedAt: Date
         let stableSince: Date
@@ -994,15 +1294,19 @@ final class ScoutProcessController {
         return formatter
     }()
 
-    private static let fileDateFormatter: DateFormatter = {
+    private static let overlayDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "America/New_York")
+        formatter.dateFormat = "MM/dd/yyyy h:mma"
         return formatter
     }()
 
-    private static let overlayDateFormatter: DateFormatter = {
+    private static let overlayDateOnlyFormatter: DateFormatter = {
         let formatter = DateFormatter()
-        formatter.dateFormat = "MM-dd-yyyy hh:mm:ss a"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "America/New_York")
+        formatter.dateFormat = "MM/dd/yyyy"
         return formatter
     }()
 

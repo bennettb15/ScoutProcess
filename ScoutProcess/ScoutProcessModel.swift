@@ -43,6 +43,7 @@ final class ScoutProcessModel {
 
     enum DirectoryKind {
         case input
+        case duplicate
         case archive
         case failed
     }
@@ -89,6 +90,7 @@ final class ScoutProcessModel {
     var lastProcessedAt: Date?
     var isDropTargeted = false
     var inputItemCount = 0
+    var duplicateItemCount = 0
     var failedItemCount = 0
     var isWatcherActive = false
 
@@ -97,6 +99,9 @@ final class ScoutProcessModel {
     private let inputMonitorQueue = DispatchQueue(label: "com.bennett.scoutprocess.input-monitor", qos: .utility)
     private var inputDirectoryFileDescriptor: CInt = -1
     private var inputDirectoryMonitor: DispatchSourceFileSystemObject?
+    private let duplicateMonitorQueue = DispatchQueue(label: "com.bennett.scoutprocess.duplicate-monitor", qos: .utility)
+    private var duplicateDirectoryFileDescriptor: CInt = -1
+    private var duplicateDirectoryMonitor: DispatchSourceFileSystemObject?
     private let failedMonitorQueue = DispatchQueue(label: "com.bennett.scoutprocess.failed-monitor", qos: .utility)
     private var failedDirectoryFileDescriptor: CInt = -1
     private var failedDirectoryMonitor: DispatchSourceFileSystemObject?
@@ -123,6 +128,7 @@ final class ScoutProcessModel {
             Task { @MainActor [weak self] in
                 self?.applyQueueUpdate(update)
                 self?.refreshInputItemCount()
+                self?.refreshDuplicateItemCount()
                 self?.refreshFailedItemCount()
             }
         }
@@ -138,12 +144,14 @@ final class ScoutProcessModel {
         controller.start()
         isWatcherActive = true
         refreshInputItemCount()
+        refreshDuplicateItemCount()
         refreshFailedItemCount()
 #if DEBUG
         logLaunchDiagnostics()
         startMemoryDiagnostics()
 #endif
         startInputDirectoryMonitor()
+        startDuplicateDirectoryMonitor()
         startFailedDirectoryMonitor()
     }
 
@@ -154,12 +162,14 @@ final class ScoutProcessModel {
         stopMemoryDiagnostics()
 #endif
         stopInputDirectoryMonitor()
+        stopDuplicateDirectoryMonitor()
         stopFailedDirectoryMonitor()
     }
 
     func openDirectory(_ kind: DirectoryKind) {
         let url: URL = switch kind {
         case .input: directories.input
+        case .duplicate: directories.duplicate
         case .archive: directories.archiveRoot
         case .failed: directories.failed
         }
@@ -168,6 +178,10 @@ final class ScoutProcessModel {
 
         if kind == .input {
             refreshInputItemCount()
+        }
+
+        if kind == .duplicate {
+            refreshDuplicateItemCount()
         }
 
         if kind == .failed {
@@ -294,6 +308,24 @@ final class ScoutProcessModel {
         failedItemCount = failedSessionFolders.isEmpty ? zipFiles.count : failedSessionFolders.count
     }
 
+    private func refreshDuplicateItemCount() {
+        let fileManager = FileManager.default
+
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: directories.duplicate,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            duplicateItemCount = 0
+            return
+        }
+
+        duplicateItemCount = contents.filter { url in
+            guard url.pathExtension.lowercased() == "zip" else { return false }
+            return (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }.count
+    }
+
     private func refreshInputItemCount() {
         let fileManager = FileManager.default
 
@@ -349,6 +381,46 @@ final class ScoutProcessModel {
         } else if inputDirectoryFileDescriptor >= 0 {
             close(inputDirectoryFileDescriptor)
             inputDirectoryFileDescriptor = -1
+        }
+    }
+
+    private func startDuplicateDirectoryMonitor() {
+        stopDuplicateDirectoryMonitor()
+
+        duplicateDirectoryFileDescriptor = open(directories.duplicate.path, O_EVTONLY)
+        guard duplicateDirectoryFileDescriptor >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: duplicateDirectoryFileDescriptor,
+            eventMask: [.write, .rename, .delete, .extend, .attrib, .link],
+            queue: duplicateMonitorQueue
+        )
+
+        source.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.refreshDuplicateItemCount()
+            }
+        }
+
+        source.setCancelHandler { [weak self] in
+            guard let self else { return }
+            if self.duplicateDirectoryFileDescriptor >= 0 {
+                close(self.duplicateDirectoryFileDescriptor)
+                self.duplicateDirectoryFileDescriptor = -1
+            }
+        }
+
+        duplicateDirectoryMonitor = source
+        source.resume()
+    }
+
+    private func stopDuplicateDirectoryMonitor() {
+        if let duplicateDirectoryMonitor {
+            duplicateDirectoryMonitor.cancel()
+            self.duplicateDirectoryMonitor = nil
+        } else if duplicateDirectoryFileDescriptor >= 0 {
+            close(duplicateDirectoryFileDescriptor)
+            duplicateDirectoryFileDescriptor = -1
         }
     }
 

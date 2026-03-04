@@ -11,6 +11,10 @@ import SwiftUI
 struct ScoutProcessApp: App {
     @State private var model = ScoutProcessModel()
 
+    init() {
+        DatabaseManager.shared.migrateIfNeeded()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()

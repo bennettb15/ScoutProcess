@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		D3B9A9F42FF5D7F000A1B2C3 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = D3B9A9F32FF5D7F000A1B2C3 /* GRDB */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		D35CE6292F53D5D000446BE7 /* ScoutProcess.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ScoutProcess.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D3B9A9F42FF5D7F000A1B2C3 /* GRDB in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +70,7 @@
 			);
 			name = ScoutProcess;
 			packageProductDependencies = (
+				D3B9A9F32FF5D7F000A1B2C3 /* GRDB */,
 			);
 			productName = ScoutProcess;
 			productReference = D35CE6292F53D5D000446BE7 /* ScoutProcess.app */;
@@ -94,6 +100,9 @@
 			);
 			mainGroup = D35CE6202F53D5D000446BE7;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				D3B9A9F22FF5D7F000A1B2C3 /* XCRemoteSwiftPackageReference "GRDB" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = D35CE62A2F53D5D000446BE7 /* Products */;
 			projectDirPath = "";
@@ -333,6 +342,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		D3B9A9F22FF5D7F000A1B2C3 /* XCRemoteSwiftPackageReference "GRDB" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/groue/GRDB.swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 7.6.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		D3B9A9F32FF5D7F000A1B2C3 /* GRDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D3B9A9F22FF5D7F000A1B2C3 /* XCRemoteSwiftPackageReference "GRDB" */;
+			productName = GRDB;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = D35CE6212F53D5D000446BE7 /* Project object */;
 }

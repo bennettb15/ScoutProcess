@@ -6,9 +6,11 @@
 //
 
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @Environment(ScoutProcessModel.self) private var model
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -24,7 +26,7 @@ struct ContentView: View {
     private var header: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 8) {
-                Image("ScoutLogoWhite")
+                Image(colorScheme == .dark ? "ScoutProcessLogoWhite" : "ScoutProcessLogoBlue")
                     .resizable()
                     .scaledToFit()
                     .frame(height: 52)
@@ -55,6 +57,22 @@ struct ContentView: View {
                                     .padding(.vertical, 2)
                                     .background(Color.orange, in: Capsule())
                                     .foregroundStyle(.white)
+                            }
+                        }
+                    }
+                    Button {
+                        model.openDirectory(.duplicate)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text("Duplicate")
+
+                            if model.duplicateItemCount > 0 {
+                                Text("\(model.duplicateItemCount)")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 2)
+                                    .background(Color.yellow, in: Capsule())
+                                    .foregroundStyle(.black)
                             }
                         }
                     }
@@ -193,8 +211,19 @@ struct ContentView: View {
 
     private var logSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Log")
-                .font(.title3.weight(.semibold))
+            HStack {
+                Text("Log")
+                    .font(.title3.weight(.semibold))
+
+                Spacer()
+
+                Button("Copy Log") {
+                    let logText = model.logLines.joined(separator: "\n")
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(logText, forType: .string)
+                }
+                .disabled(model.logLines.isEmpty)
+            }
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
@@ -204,6 +233,7 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
+                .textSelection(.enabled)
             }
             .padding(12)
             .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
