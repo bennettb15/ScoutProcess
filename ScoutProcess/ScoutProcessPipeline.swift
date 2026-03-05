@@ -529,7 +529,7 @@ final class ScoutProcessController {
                             extractedFolderURL: archivedSessionURL,
                             zipName: workingZipURL.lastPathComponent
                         )
-                        log("SessionReport.pdf created at \(pdfURL.path(percentEncoded: false))")
+                        log("Session report created at \(pdfURL.path(percentEncoded: false))")
                     } catch {
                         log("Session report generation failed for session \(importedSessionID): \(error.localizedDescription)")
                     }

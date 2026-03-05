@@ -60,6 +60,8 @@ final class PDFSessionReportGenerator {
                     shots.shot_key,
                     shots.logical_shot_identity,
                     shots.captured_at_utc,
+                    shots.latitude,
+                    shots.longitude,
                     shots.original_filename,
                     shots.stamped_jpeg_filename,
                     shots.is_flagged,
@@ -116,13 +118,6 @@ final class PDFSessionReportGenerator {
             throw PDFSessionReportError.pdfContextCreationFailed(pdfURL.path)
         }
 
-        var pageNumber = 1
-
-        pdfContext.beginPDFPage(nil as CFDictionary?)
-        drawCoverPage(in: pdfContext, context: context, pageNumber: pageNumber)
-        pdfContext.endPDFPage()
-        pageNumber += 1
-
         let photoEntries = context.shots.map { shot in
             let resolvedImage = imageCatalog.resolveImage(for: shot)
             if resolvedImage == nil {
@@ -130,9 +125,62 @@ final class PDFSessionReportGenerator {
             }
             return SessionReportPhotoEntry(shot: shot, imageURL: resolvedImage?.url)
         }
+        let groupedPhotoSections = makeGroupedPhotoSections(from: photoEntries)
+        let coverImageURL = photoEntries.first(where: { $0.imageURL != nil })?.imageURL
+        let coverImage = coverImageURL.flatMap { loadOptimizedCGImage(at: $0) }
 
-        for chunkStart in stride(from: 0, to: photoEntries.count, by: 2) {
-            let pageEntries = Array(photoEntries[chunkStart..<min(chunkStart + 2, photoEntries.count)])
+        var pageNumber = 1
+        pdfContext.beginPDFPage(nil as CFDictionary?)
+        drawCoverPage(
+            in: pdfContext,
+            context: context,
+            pageNumber: pageNumber,
+            coverImage: coverImage
+        )
+        pdfContext.endPDFPage()
+        pageNumber += 1
+
+        pdfContext.beginPDFPage(nil as CFDictionary?)
+        drawDocumentationScopePage(in: pdfContext, context: context, pageNumber: pageNumber)
+        pdfContext.endPDFPage()
+        pageNumber += 1
+
+        var assumedIndexPageCount = 1
+        var photoSectionPlans: [PhotoSectionRenderPlan] = []
+        var indexPagePlans: [DocumentationIndexPagePlan] = []
+        for _ in 0..<3 {
+            let photoStartPage = 3 + assumedIndexPageCount
+            photoSectionPlans = makePhotoSectionRenderPlans(
+                from: groupedPhotoSections,
+                startingPage: photoStartPage
+            )
+            indexPagePlans = makeDocumentationIndexPagePlans(for: photoSectionPlans)
+            let resolvedCount = max(1, indexPagePlans.count)
+            if resolvedCount == assumedIndexPageCount {
+                break
+            }
+            assumedIndexPageCount = resolvedCount
+        }
+
+        if indexPagePlans.isEmpty {
+            indexPagePlans = [DocumentationIndexPagePlan(pageIndex: 0, lines: [])]
+        }
+
+        for indexPlan in indexPagePlans {
+            pdfContext.beginPDFPage(nil as CFDictionary?)
+            drawDocumentationIndexPage(
+                in: pdfContext,
+                context: context,
+                pageNumber: pageNumber,
+                plan: indexPlan
+            )
+            pdfContext.endPDFPage()
+            pageNumber += 1
+        }
+
+        for sectionPlan in photoSectionPlans {
+            for chunk in sectionPlan.pageChunks {
+                let pageEntries = chunk.entries
             pdfContext.beginPDFPage(nil as CFDictionary?)
             drawPhotoPage(
                 in: pdfContext,
@@ -142,12 +190,285 @@ final class PDFSessionReportGenerator {
             )
             pdfContext.endPDFPage()
             pageNumber += 1
+            }
         }
 
         pdfContext.closePDF()
     }
 
+    private func makeGroupedPhotoSections(from entries: [SessionReportPhotoEntry]) -> [GroupedPhotoSection] {
+        var orderedKeys: [String] = []
+        var groupedEntries: [String: [SessionReportPhotoEntry]] = [:]
+        var groupedMeta: [String: (building: String, elevation: String)] = [:]
+
+        for entry in entries {
+            let building = friendlyBuildingLabel(displayText(entry.shot.building, fallback: "Building"))
+            let elevation = displayText(entry.shot.elevation, fallback: "Unknown")
+            let key = "\(building.uppercased())|\(elevation.uppercased())"
+
+            if groupedEntries[key] == nil {
+                orderedKeys.append(key)
+                groupedMeta[key] = (building: building, elevation: elevation)
+                groupedEntries[key] = []
+            }
+            groupedEntries[key, default: []].append(entry)
+        }
+
+        return orderedKeys.compactMap { key in
+            guard let meta = groupedMeta[key], let entries = groupedEntries[key], entries.isEmpty == false else {
+                return nil
+            }
+            let title = "\(meta.building) \(meta.elevation) Elevation"
+            return GroupedPhotoSection(key: key, title: title, entries: entries)
+        }
+    }
+
+    private func makePhotoSectionRenderPlans(
+        from groupedSections: [GroupedPhotoSection],
+        startingPage: Int
+    ) -> [PhotoSectionRenderPlan] {
+        var plans: [PhotoSectionRenderPlan] = []
+        var nextPage = startingPage
+
+        for section in groupedSections {
+            var chunks: [PhotoChunkPlan] = []
+            for chunkStart in stride(from: 0, to: section.entries.count, by: 2) {
+                let pageEntries = Array(section.entries[chunkStart..<min(chunkStart + 2, section.entries.count)])
+                chunks.append(PhotoChunkPlan(pageNumber: nextPage, entries: pageEntries))
+                nextPage += 1
+            }
+
+            let startPage = chunks.first?.pageNumber ?? nextPage
+            let endPage = chunks.last?.pageNumber ?? startPage
+            plans.append(
+                PhotoSectionRenderPlan(
+                    key: section.key,
+                    title: section.title,
+                    entries: section.entries,
+                    pageChunks: chunks,
+                    startPage: startPage,
+                    endPage: endPage
+                )
+            )
+        }
+
+        return plans
+    }
+
+    private func makeDocumentationIndexPagePlans(
+        for sectionPlans: [PhotoSectionRenderPlan]
+    ) -> [DocumentationIndexPagePlan] {
+        let lines = makeDocumentationIndexLines(for: sectionPlans)
+        if lines.isEmpty {
+            return []
+        }
+
+        let leftMargin: CGFloat = 64
+        let rightMargin: CGFloat = 64
+        let topY: CGFloat = Self.pageSize.height - 106
+        let bottomY: CGFloat = 96
+        let usableWidth = Self.pageSize.width - leftMargin - rightMargin
+
+        var pages: [DocumentationIndexPagePlan] = []
+        var pageIndex = 0
+        var cursorY = topY
+        var placedLines: [DocumentationIndexPlacedLine] = []
+
+        func commitPageIfNeeded() {
+            if placedLines.isEmpty == false {
+                pages.append(DocumentationIndexPagePlan(pageIndex: pageIndex, lines: placedLines))
+                placedLines = []
+            }
+        }
+
+        for line in lines {
+            let lineHeight: CGFloat = line.kind == .sectionHeader ? 18 : 15
+            let lineSpacing: CGFloat = line.kind == .sectionHeader ? 8 : 3
+
+            if cursorY - lineHeight < bottomY {
+                commitPageIfNeeded()
+                pageIndex += 1
+                cursorY = topY
+            }
+
+            let lineRect = CGRect(x: leftMargin, y: cursorY - lineHeight, width: usableWidth, height: lineHeight)
+            placedLines.append(DocumentationIndexPlacedLine(line: line, rect: lineRect))
+            cursorY -= (lineHeight + lineSpacing)
+        }
+
+        commitPageIfNeeded()
+        return pages
+    }
+
+    private func makeDocumentationIndexLines(for sectionPlans: [PhotoSectionRenderPlan]) -> [DocumentationIndexLine] {
+        var lines: [DocumentationIndexLine] = []
+        for section in sectionPlans {
+            lines.append(DocumentationIndexLine(
+                kind: .sectionHeader,
+                text: "\(section.title) pages \(section.startPage)-\(section.endPage)",
+                pageNumber: nil,
+                isFlagged: false
+            ))
+            for (index, entry) in section.entries.enumerated() {
+                let photoPageNumber = section.startPage + (index / 2)
+                let caption = captionIdentityLine(for: entry.shot)
+                lines.append(DocumentationIndexLine(
+                    kind: .photoItem,
+                    text: caption,
+                    pageNumber: photoPageNumber,
+                    isFlagged: entry.shot.isFlagged == 1
+                ))
+            }
+        }
+        return lines
+    }
+
     private func drawCoverPage(
+        in pdfContext: CGContext,
+        context: SessionReportContext,
+        pageNumber: Int,
+        coverImage: CGImage?
+    ) {
+        let bounds = CGRect(origin: .zero, size: Self.pageSize)
+        withGraphicsContext(pdfContext) {
+            NSColor.white.setFill()
+            bounds.fill()
+
+            let session = context.session
+            let horizontalMargin: CGFloat = 72
+
+            if let logoImage = loadReportLogoImage() {
+                let logoContainer = CGRect(
+                    x: horizontalMargin,
+                    y: bounds.height - 160,
+                    width: bounds.width - (horizontalMargin * 2),
+                    height: 80
+                )
+                drawAspectFit(image: logoImage, in: logoContainer)
+            } else {
+                drawText(
+                    "SCOUT",
+                    in: CGRect(x: horizontalMargin, y: bounds.height - 150, width: bounds.width - (horizontalMargin * 2), height: 80),
+                    font: .systemFont(ofSize: 66, weight: .bold),
+                    color: .black,
+                    alignment: .center
+                )
+            }
+
+            let imageRect = CGRect(
+                x: 126,
+                y: bounds.height - 360,
+                width: bounds.width - 252,
+                height: 182
+            )
+            if let coverImage {
+                let fitted = aspectFitRect(for: coverImage, in: imageRect)
+                pdfContext.saveGState()
+                let clipPath = NSBezierPath(roundedRect: fitted, xRadius: 12, yRadius: 12)
+                clipPath.addClip()
+                pdfContext.draw(coverImage, in: fitted)
+                pdfContext.restoreGState()
+            } else {
+                NSColor(white: 0.94, alpha: 1).setFill()
+                imageRect.fill()
+            }
+
+            drawText(
+                "Visual Property Record",
+                in: CGRect(x: horizontalMargin, y: imageRect.minY - 54, width: bounds.width - (horizontalMargin * 2), height: 28),
+                font: .systemFont(ofSize: 20, weight: .bold),
+                color: .black,
+                alignment: .center
+            )
+
+            let shotDates = context.shots.compactMap { shot -> Date? in
+                guard let raw = shot.capturedAtUTC else { return nil }
+                return Self.parseUTCDate(raw)
+            }
+            let firstShotDate = shotDates.first ?? Self.parseUTCDate(session.startedAtUTC)
+            let lastShotDate = shotDates.last ?? Self.parseUTCDate(session.endedAtUTC ?? session.startedAtUTC)
+            let weatherAnchorShot = context.shots.first { shot in
+                shot.latitude != nil && shot.longitude != nil
+            }
+            let weatherSummary: String? = {
+                guard let weatherAnchorShot,
+                      let latitude = weatherAnchorShot.latitude,
+                      let longitude = weatherAnchorShot.longitude,
+                      let targetDate = firstShotDate else {
+                    return nil
+                }
+                return fetchOpenMeteoWeatherSummary(
+                    latitude: latitude,
+                    longitude: longitude,
+                    at: targetDate
+                )
+            }()
+            let dateOfService = firstShotDate.map { Self.shortDateFormatter.string(from: $0) } ?? "Unknown"
+            let timeWindow: String = {
+                guard let firstShotDate else { return "Unknown" }
+                let firstTime = Self.shortTimeFormatter.string(from: firstShotDate)
+                guard let lastShotDate else { return firstTime }
+                let lastTime = Self.shortTimeFormatter.string(from: lastShotDate)
+                return firstTime == lastTime ? firstTime : "\(firstTime) to \(lastTime)"
+            }()
+            let reportDate = Self.shortDateFormatter.string(from: Date())
+
+            let baseDetails: [(label: String?, value: String, isItalic: Bool)] = [
+                ("Property Name:", session.propertyName ?? "Unknown Property", false),
+                ("Property Address:", formattedAddress(for: session), false),
+                ("Date of Service:", dateOfService, false),
+                ("Time Window:", timeWindow, false),
+                ("Report Reference ID:", session.sessionID, false),
+                (nil, "", false),
+                ("Prepared by:", "", false),
+                (nil, "SCOUT - Visual Documentation Services", false),
+                (nil, "Clear, time-stamped visual documentation of observable property conditions.", false),
+                ("Report Date:", reportDate, false),
+            ]
+            var details = baseDetails
+            if let weatherSummary {
+                details.insert(("Weather at service start:", weatherSummary, false), at: 4)
+                details.insert((nil, "Weather data provided by Open-Meteo.", true), at: 5)
+            }
+            details.insert((nil, "*Weather conditions may have affected visibility at the time of documentation", true), at: min(5, details.count))
+
+            var lineY = imageRect.minY - 96
+            for line in details {
+                let lineRect = CGRect(x: horizontalMargin, y: lineY, width: bounds.width - (horizontalMargin * 2), height: 16)
+                if line.isItalic {
+                    drawText(
+                        line.value,
+                        in: lineRect,
+                        font: NSFontManager.shared.convert(.systemFont(ofSize: 10), toHaveTrait: .italicFontMask),
+                        color: .black,
+                        alignment: .center
+                    )
+                } else if let label = line.label {
+                    drawCenteredLabeledLine(
+                        label: label,
+                        value: line.value,
+                        in: lineRect
+                    )
+                } else {
+                    drawText(
+                        line.value,
+                        in: lineRect,
+                        font: .systemFont(ofSize: 11, weight: .regular),
+                        color: .black,
+                        alignment: .center
+                    )
+                }
+                if line.label == "Prepared by:" {
+                    lineY -= 8
+                }
+                lineY -= (line.value.isEmpty && line.label == nil) ? 12 : 18
+            }
+
+            drawFooter(pageNumber: pageNumber, in: bounds)
+        }
+    }
+
+    private func drawDocumentationScopePage(
         in pdfContext: CGContext,
         context: SessionReportContext,
         pageNumber: Int
@@ -156,43 +477,129 @@ final class PDFSessionReportGenerator {
         withGraphicsContext(pdfContext) {
             NSColor.white.setFill()
             bounds.fill()
+            drawCenteredHeaderLogo(in: bounds)
 
-            let leftMargin: CGFloat = 72
-            var cursorY: CGFloat = bounds.height - 120
+            let leftMargin: CGFloat = 64
+            let rightMargin: CGFloat = 64
+            let contentWidth = bounds.width - leftMargin - rightMargin
+
+            let sessionAddress = formattedAddress(for: context.session)
+
+            let bodyRect = CGRect(
+                x: leftMargin,
+                y: 112,
+                width: contentWidth,
+                height: bounds.height - 214
+            )
+            drawDocumentationScopeBody(in: bodyRect)
+
+            drawAddressFooter(
+                pageNumber: pageNumber,
+                in: bounds,
+                address: sessionAddress
+            )
+        }
+    }
+
+    private func drawDocumentationIndexPage(
+        in pdfContext: CGContext,
+        context: SessionReportContext,
+        pageNumber: Int,
+        plan: DocumentationIndexPagePlan
+    ) {
+        let bounds = CGRect(origin: .zero, size: Self.pageSize)
+        withGraphicsContext(pdfContext) {
+            NSColor.white.setFill()
+            bounds.fill()
+            drawCenteredHeaderLogo(in: bounds)
 
             drawText(
-                "SCOUT Session Report",
-                in: CGRect(x: leftMargin, y: cursorY, width: bounds.width - (leftMargin * 2), height: 34),
-                font: .systemFont(ofSize: 28, weight: .bold)
+                "Documentation Index",
+                in: CGRect(x: 64, y: bounds.height - 100, width: bounds.width - 128, height: 24),
+                font: .systemFont(ofSize: 24, weight: .bold),
+                color: .black,
+                alignment: .left
             )
-            cursorY -= 56
 
-            let session = context.session
-            let address = formattedAddress(for: session)
-            let started = formattedUTC(session.startedAtUTC) ?? session.startedAtUTC
-            let ended = formattedUTC(session.endedAtUTC) ?? "Open"
-            let generatedAt = Self.displayDateTimeFormatter.string(from: Date())
-            let shortSessionID = String(session.sessionID.prefix(8))
-
-            let coverLines: [String] = [
-                "Organization: \(session.orgName ?? "Unknown Org")",
-                "Property: \(session.propertyName ?? "Unknown Property")",
-                "Address: \(address)",
-                "Session: \(started) to \(ended)",
-                "Session ID: \(shortSessionID)",
-                "Generated: \(generatedAt)",
-            ]
-
-            for line in coverLines {
+            if plan.lines.isEmpty {
                 drawText(
-                    line,
-                    in: CGRect(x: leftMargin, y: cursorY, width: bounds.width - (leftMargin * 2), height: 24),
-                    font: .systemFont(ofSize: 15, weight: .regular)
+                    "No photos available for index.",
+                    in: CGRect(x: 64, y: bounds.height - 130, width: bounds.width - 128, height: 16),
+                    font: .systemFont(ofSize: 11, weight: .regular),
+                    color: .black,
+                    alignment: .left
                 )
-                cursorY -= 30
+            } else {
+                for placed in plan.lines {
+                    switch placed.line.kind {
+                    case .sectionHeader:
+                        drawText(
+                            placed.line.text,
+                            in: placed.rect,
+                            font: .systemFont(ofSize: 11, weight: .semibold),
+                            color: .black,
+                            alignment: .left
+                        )
+                    case .photoItem:
+                        let pageRect = CGRect(
+                            x: placed.rect.maxX - 34,
+                            y: placed.rect.minY,
+                            width: 34,
+                            height: placed.rect.height
+                        )
+                        let textRect = CGRect(
+                            x: placed.rect.minX,
+                            y: placed.rect.minY,
+                            width: placed.rect.width - 44,
+                            height: placed.rect.height
+                        )
+                        if placed.line.isFlagged {
+                            drawFlaggedNote(
+                                text: placed.line.text,
+                                in: textRect,
+                                font: .systemFont(ofSize: 9, weight: .regular),
+                                alignment: .left
+                            )
+                        } else {
+                            drawText(
+                                placed.line.text,
+                                in: textRect,
+                                font: .systemFont(ofSize: 9, weight: .regular),
+                                color: .black,
+                                alignment: .left
+                            )
+                        }
+
+                        if let pageNumber = placed.line.pageNumber {
+                            let leaderY = textRect.midY
+                            pdfContext.saveGState()
+                            pdfContext.setStrokeColor(NSColor.black.withAlphaComponent(0.35).cgColor)
+                            pdfContext.setLineWidth(0.6)
+                            pdfContext.setLineDash(phase: 0, lengths: [1.5, 2.5])
+                            pdfContext.move(to: CGPoint(x: textRect.maxX + 2, y: leaderY))
+                            pdfContext.addLine(to: CGPoint(x: pageRect.minX - 4, y: leaderY))
+                            pdfContext.strokePath()
+                            pdfContext.restoreGState()
+                        }
+
+                        if let pageNumber = placed.line.pageNumber {
+                            drawText(
+                                "\(pageNumber)",
+                                in: pageRect,
+                                font: .systemFont(ofSize: 9, weight: .regular),
+                                color: .black,
+                                alignment: .right
+                            )
+                        }
+                    }
+                }
             }
 
-            drawFooter(pageNumber: pageNumber, in: bounds)
+            drawAddressFooter(
+                pageNumber: pageNumber,
+                in: bounds,
+                address: formattedAddress(for: context.session)
+            )
         }
     }
 
@@ -206,13 +613,16 @@ final class PDFSessionReportGenerator {
         withGraphicsContext(pdfContext) {
             NSColor.white.setFill()
             bounds.fill()
+            drawCenteredHeaderLogo(in: bounds)
 
-            let outerMargin: CGFloat = 36
-            let footerHeight: CGFloat = 22
+            let outerMargin: CGFloat = 18
+            let footerHeight: CGFloat = 82
             let headerHeight: CGFloat = includeHeader ? 20 : 0
-            let photoCaptionGap: CGFloat = 10
+            let logoHeaderReserve: CGFloat = 34
+            let photoStackVerticalOffset: CGFloat = 28
+            let photoCaptionGap: CGFloat = 8
             let metadataHeight: CGFloat = 66
-            let slotGap: CGFloat = 10
+            let slotGap: CGFloat = 2
 
             if includeHeader {
                 let headerLine = "\(context.session.propertyName ?? "Property")  |  \(formattedUTC(context.session.startedAtUTC) ?? context.session.startedAtUTC)"
@@ -225,12 +635,12 @@ final class PDFSessionReportGenerator {
                         height: 14
                     ),
                     font: .systemFont(ofSize: 10, weight: .medium),
-                    color: .darkGray
+                    color: .black
                 )
             }
 
-            let contentTop = bounds.height - outerMargin - headerHeight
-            let contentBottom = outerMargin + footerHeight
+            let contentTop = bounds.height - outerMargin - headerHeight - logoHeaderReserve - photoStackVerticalOffset
+            let contentBottom = outerMargin + footerHeight - photoStackVerticalOffset
             let contentHeight = contentTop - contentBottom
             let slotHeight = (contentHeight - slotGap) / 2
             let slotWidth = bounds.width - (outerMargin * 2)
@@ -270,7 +680,7 @@ final class PDFSessionReportGenerator {
                         "Image unavailable",
                         in: photoAvailableRect,
                         font: .systemFont(ofSize: 14, weight: .medium),
-                        color: .darkGray,
+                        color: .black,
                         alignment: .center,
                         verticalCenter: true
                     )
@@ -279,49 +689,65 @@ final class PDFSessionReportGenerator {
                 drawMetadataBlock(for: entry.shot, in: captionRect)
             }
 
-            drawFooter(pageNumber: pageNumber, in: bounds)
+            drawAddressFooter(
+                pageNumber: pageNumber,
+                in: bounds,
+                address: formattedAddress(for: context.session)
+            )
         }
     }
 
     private func drawFooter(pageNumber: Int, in bounds: CGRect) {
+        let contentMargin: CGFloat = 64
         drawText(
             "Page \(pageNumber)",
-            in: CGRect(x: 0, y: 20, width: bounds.width, height: 12),
+            in: CGRect(x: 0, y: 10, width: bounds.width - contentMargin, height: 12),
             font: .systemFont(ofSize: 10, weight: .regular),
-            color: .darkGray,
-            alignment: .center
+            color: .black,
+            alignment: .right
+        )
+    }
+
+    private func drawAddressFooter(pageNumber: Int, in bounds: CGRect, address: String) {
+        let contentMargin: CGFloat = 64
+        _ = drawWrappedText(
+            "This visual property record provides visual documentation only. It does not constitute an inspection, assessment, certification, or determination of condition, safety, or compliance. Documentation reflects only what was visually captured at the time of the site visit.",
+            in: CGRect(x: contentMargin, y: 24, width: bounds.width - (contentMargin * 2), height: 40),
+            font: .systemFont(ofSize: 8, weight: .regular),
+            color: .black
+        )
+        drawText(
+            address,
+            in: CGRect(x: contentMargin, y: 10, width: bounds.width - (contentMargin * 2), height: 12),
+            font: .systemFont(ofSize: 9, weight: .regular),
+            color: .black,
+            alignment: .left
+        )
+        drawText(
+            "Page \(pageNumber)",
+            in: CGRect(x: 0, y: 10, width: bounds.width - contentMargin, height: 12),
+            font: .systemFont(ofSize: 10, weight: .regular),
+            color: .black,
+            alignment: .right
         )
     }
 
     private func drawMetadataBlock(for shot: SessionReportShot, in rect: CGRect) {
         let titleFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
         let bodyFont = NSFont.systemFont(ofSize: 10, weight: .regular)
-        let noteFont = NSFont.systemFont(ofSize: 10, weight: .regular)
         let lineHeight: CGFloat = 14
         let topY = rect.maxY - lineHeight
 
-        let identityLine = [
-            displayText(shot.building, fallback: "B1"),
-            displayText(shot.elevation, fallback: "North"),
-            displayText(shot.detailType, fallback: "General Elevation"),
-            detailIdentifier(for: shot),
-        ]
-        .joined(separator: " | ")
-        .uppercased()
+        let identityLine = captionIdentityLine(for: shot)
 
         let capturedAt = formattedUTC(shot.capturedAtUTC) ?? "Unknown"
+        let secondLineY = topY - lineHeight
+        let thirdLineY = topY - (lineHeight * 2)
 
         drawText(
             identityLine,
             in: CGRect(x: rect.minX, y: topY, width: rect.width, height: lineHeight),
             font: titleFont,
-            alignment: .center
-        )
-        drawText(
-            capturedAt,
-            in: CGRect(x: rect.minX, y: topY - lineHeight, width: rect.width, height: lineHeight),
-            font: bodyFont,
-            color: .darkGray,
             alignment: .center
         )
 
@@ -330,10 +756,37 @@ final class PDFSessionReportGenerator {
             let noteText = (flaggedReason?.isEmpty == false) ? flaggedReason! : "Flagged"
             drawFlaggedNote(
                 text: noteText,
-                in: CGRect(x: rect.minX, y: topY - (lineHeight * 2), width: rect.width, height: lineHeight),
-                font: noteFont
+                in: CGRect(x: rect.minX, y: secondLineY, width: rect.width, height: lineHeight),
+                font: bodyFont,
+                alignment: .center
+            )
+            drawText(
+                capturedAt,
+                in: CGRect(x: rect.minX, y: thirdLineY, width: rect.width, height: lineHeight),
+                font: bodyFont,
+                color: .black,
+                alignment: .center
+            )
+        } else {
+            drawText(
+                capturedAt,
+                in: CGRect(x: rect.minX, y: secondLineY, width: rect.width, height: lineHeight),
+                font: bodyFont,
+                color: .black,
+                alignment: .center
             )
         }
+    }
+
+    private func captionIdentityLine(for shot: SessionReportShot) -> String {
+        [
+            friendlyBuildingLabel(displayText(shot.building, fallback: "B1")),
+            displayText(shot.elevation, fallback: "North"),
+            displayText(shot.detailType, fallback: "General Elevation"),
+            friendlyAngleLabel(detailIdentifier(for: shot)),
+        ]
+        .joined(separator: " | ")
+        .uppercased()
     }
 
     private func drawFlaggedBorder(around rect: CGRect, in context: CGContext) {
@@ -355,9 +808,14 @@ final class PDFSessionReportGenerator {
         context.restoreGState()
     }
 
-    private func drawFlaggedNote(text: String, in rect: CGRect, font: NSFont) {
+    private func drawFlaggedNote(
+        text: String,
+        in rect: CGRect,
+        font: NSFont,
+        alignment: NSTextAlignment
+    ) {
         let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .center
+        paragraph.alignment = alignment
         paragraph.lineBreakMode = .byTruncatingTail
 
         let note = NSMutableAttributedString()
@@ -373,11 +831,24 @@ final class PDFSessionReportGenerator {
             string: text,
             attributes: [
                 .font: font,
-                .foregroundColor: NSColor.darkGray,
+                .foregroundColor: NSColor.black,
                 .paragraphStyle: paragraph,
             ]
         ))
         note.draw(in: rect)
+    }
+
+    private func drawCenteredHeaderLogo(in bounds: CGRect) {
+        guard let logoImage = loadReportLogoImage() else { return }
+        let width: CGFloat = 170
+        let height: CGFloat = 34
+        let rect = CGRect(
+            x: (bounds.width - width) / 2,
+            y: bounds.height - 56,
+            width: width,
+            height: height
+        )
+        drawAspectFit(image: logoImage, in: rect)
     }
 
     private func displayShotLabel(for shot: SessionReportShot) -> String {
@@ -394,6 +865,35 @@ final class PDFSessionReportGenerator {
             return trimmedShotKey
         }
         return "A\(shot.angleIndex ?? 0)"
+    }
+
+    private func friendlyBuildingLabel(_ value: String) -> String {
+        if let number = numericSuffix(forPrefix: "B", in: value) {
+            return "Building \(number)"
+        }
+        return value
+    }
+
+    private func friendlyAngleLabel(_ value: String) -> String {
+        if let number = numericSuffix(forPrefix: "A", in: value) {
+            return "Angle \(number)"
+        }
+        return value
+    }
+
+    private func numericSuffix(forPrefix prefix: String, in value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pattern = "^\(NSRegularExpression.escapedPattern(for: prefix))\\s*(\\d+)$"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let fullRange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+        guard let match = regex.firstMatch(in: trimmed, options: [], range: fullRange),
+              match.numberOfRanges > 1,
+              let numberRange = Range(match.range(at: 1), in: trimmed) else {
+            return nil
+        }
+        return String(trimmed[numberRange])
     }
 
     private func displayText(_ value: String?, fallback: String) -> String {
@@ -538,6 +1038,14 @@ final class PDFSessionReportGenerator {
                 attributes: attributes
             )
             drawRect.origin.y += max(0, (rect.height - ceil(measured.height)) / 2)
+            drawRect = drawRect.insetBy(dx: 0, dy: -1)
+        } else {
+            drawRect = CGRect(
+                x: rect.minX,
+                y: rect.minY - 1,
+                width: rect.width,
+                height: rect.height + 2
+            )
         }
 
         (text as NSString).draw(in: drawRect, withAttributes: attributes)
@@ -557,6 +1065,260 @@ final class PDFSessionReportGenerator {
         NSLog("[PDFSessionReportGenerator] %@", message)
     }
 
+    private func loadReportLogoImage() -> NSImage? {
+        NSImage(named: "ScoutLogoBlue")
+            ?? NSImage(named: "ScoutProcessLogoBlue")
+            ?? NSImage(named: "ScoutProcessLogoWhite")
+            ?? NSImage(named: "ScoutLogoWhite")
+    }
+
+    private func drawAspectFit(image: NSImage, in container: CGRect) {
+        guard image.size.width > 0, image.size.height > 0 else {
+            image.draw(in: container)
+            return
+        }
+        let scale = min(container.width / image.size.width, container.height / image.size.height)
+        let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let rect = CGRect(
+            x: container.minX + (container.width - size.width) / 2,
+            y: container.minY + (container.height - size.height) / 2,
+            width: size.width,
+            height: size.height
+        )
+        image.draw(in: rect)
+    }
+
+    private func drawCenteredLabeledLine(label: String, value: String, in rect: CGRect) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byTruncatingTail
+
+        let labelAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.black,
+            .paragraphStyle: paragraph,
+        ]
+        let valueAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.black,
+            .paragraphStyle: paragraph,
+        ]
+
+        let labelSize = (label as NSString).size(withAttributes: labelAttributes)
+        let valueSize = (value as NSString).size(withAttributes: valueAttributes)
+        let totalWidth = ceil(labelSize.width + (value.isEmpty ? 0 : 4) + valueSize.width)
+        let startX = rect.minX + max(0, (rect.width - totalWidth) / 2)
+        let textRect = CGRect(x: rect.minX, y: rect.minY - 1, width: rect.width, height: rect.height + 2)
+
+        (label as NSString).draw(
+            in: CGRect(x: startX, y: textRect.minY, width: ceil(labelSize.width), height: textRect.height),
+            withAttributes: labelAttributes
+        )
+        if value.isEmpty == false {
+            (value as NSString).draw(
+                in: CGRect(x: startX + ceil(labelSize.width) + 4, y: textRect.minY, width: rect.maxX - startX, height: textRect.height),
+                withAttributes: valueAttributes
+            )
+        }
+    }
+
+    private func drawDocumentationScopeBody(in rect: CGRect) {
+        let titleColor = NSColor.black
+        let bodyColor = NSColor.black
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineSpacing = 1
+
+        let body = NSMutableAttributedString()
+        func append(_ text: String, font: NSFont) {
+            body.append(NSAttributedString(
+                string: text,
+                attributes: [
+                    .font: font,
+                    .foregroundColor: bodyColor,
+                    .paragraphStyle: paragraph,
+                ]
+            ))
+        }
+        func appendHeader(_ text: String) {
+            body.append(NSAttributedString(
+                string: text,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 19, weight: .bold),
+                    .foregroundColor: titleColor,
+                    .paragraphStyle: paragraph,
+                ]
+            ))
+        }
+
+        appendHeader("Documentation Scope\n")
+        append("SCOUT documents observable property features as they appear at the time of service. Deliverables consist of time-stamped photographs and structured notes intended for reference and visual comparison over time.\n\n", font: .systemFont(ofSize: 11, weight: .regular))
+        appendHeader("Inclusions\n")
+        append("•  Visual documentation of accessible exterior areas\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("•  Visual documentation of accessible interior common areas (if applicable)\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("•  Time-stamped photographs organized by area or elevation\n\n", font: .systemFont(ofSize: 11, weight: .regular))
+        appendHeader("Exclusions\n")
+        append("This report does not include:\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("•  Inspections, evaluations, or professional assessments\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("•  Engineering, architectural, or code compliance analysis\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("•  Testing, probing, monitoring, or measurements\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("•  Identification of concealed or latent conditions\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("•  Opinions regarding cause, severity, responsibility, or repair methods\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("•  Cost estimates, pricing, or scope recommendations\n\n", font: .systemFont(ofSize: 11, weight: .regular))
+        appendHeader("Limitations\n")
+        append("Documentation was limited by accessibility, visibility, weather conditions, lighting, and site conditions present at the time of service.\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("Location-based descriptive notes are limited to factual identification of visually observable conditions only.\n", font: .systemFont(ofSize: 11, weight: .regular))
+        append("This record reflects conditions observed only at the documented date and time. No ongoing monitoring or updates are implied.\n\n", font: .systemFont(ofSize: 11, weight: .regular))
+        appendHeader("Use of record\n")
+        append("This report is intended for documentation and recordkeeping purposes only. It is not suitable for design, construction planning, engineering evaluation, or regulatory compliance.\n", font: .systemFont(ofSize: 10.5, weight: .regular))
+        append("Use of this report is limited to the client identified on Page 1 unless otherwise authorized in writing by SCOUT.", font: .systemFont(ofSize: 10.5, weight: .regular))
+
+        body.draw(in: rect)
+    }
+
+    @discardableResult
+    private func drawWrappedText(
+        _ text: String,
+        in rect: CGRect,
+        font: NSFont,
+        color: NSColor = .black,
+        lineHeightMultiple: CGFloat = 1.1
+    ) -> CGFloat {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineHeightMultiple = lineHeightMultiple
+
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: color,
+            .paragraphStyle: paragraph,
+        ]
+        let attributed = NSAttributedString(string: text, attributes: attributes)
+        let measured = attributed.boundingRect(
+            with: CGSize(width: rect.width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        let height = ceil(measured.height) + 2
+        let drawRect = CGRect(x: rect.minX, y: rect.maxY - height - 1, width: rect.width, height: height)
+        attributed.draw(in: drawRect)
+        return drawRect.minY
+    }
+
+    @discardableResult
+    private func drawBulletList(
+        _ items: [String],
+        in rect: CGRect,
+        font: NSFont,
+        color: NSColor = .black
+    ) -> CGFloat {
+        var cursorY = rect.maxY
+        for item in items {
+            let bulletX = rect.minX + 3
+            let textX = rect.minX + 16
+            drawText(
+                "•",
+                in: CGRect(x: bulletX, y: cursorY - 14, width: 10, height: 14),
+                font: font,
+                color: color
+            )
+            cursorY = drawWrappedText(
+                item,
+                in: CGRect(x: textX, y: 0, width: rect.width - 16, height: cursorY),
+                font: font,
+                color: color
+            ) - 4
+        }
+        return cursorY
+    }
+
+    private func fetchOpenMeteoWeatherSummary(
+        latitude: Double,
+        longitude: Double,
+        at targetDate: Date
+    ) -> String? {
+        let day = Self.fileDateFormatter.string(from: targetDate)
+        var components = URLComponents(string: "https://archive-api.open-meteo.com/v1/archive")
+        components?.queryItems = [
+            URLQueryItem(name: "latitude", value: String(format: "%.6f", latitude)),
+            URLQueryItem(name: "longitude", value: String(format: "%.6f", longitude)),
+            URLQueryItem(name: "start_date", value: day),
+            URLQueryItem(name: "end_date", value: day),
+            URLQueryItem(name: "hourly", value: "temperature_2m,weather_code,wind_speed_10m,precipitation"),
+            URLQueryItem(name: "temperature_unit", value: "fahrenheit"),
+            URLQueryItem(name: "wind_speed_unit", value: "mph"),
+            URLQueryItem(name: "precipitation_unit", value: "inch"),
+            URLQueryItem(name: "timezone", value: "America/New_York"),
+        ]
+        guard let url = components?.url else { return nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForResource = 8
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var responseData: Data?
+        session.dataTask(with: url) { data, _, _ in
+            responseData = data
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 9)
+
+        guard let responseData,
+              let payload = try? JSONDecoder().decode(OpenMeteoArchiveResponse.self, from: responseData),
+              let hourly = payload.hourly else {
+            return nil
+        }
+
+        let timeFormatter = DateFormatter()
+        timeFormatter.locale = Locale(identifier: "en_US_POSIX")
+        timeFormatter.timeZone = Self.displayTimeZone
+        timeFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
+
+        let timestamps = hourly.time.compactMap { timeFormatter.date(from: $0) }
+        guard timestamps.isEmpty == false else { return nil }
+
+        let targetIndex = timestamps.enumerated().min { lhs, rhs in
+            abs(lhs.element.timeIntervalSince(targetDate)) < abs(rhs.element.timeIntervalSince(targetDate))
+        }?.offset
+        guard let targetIndex else { return nil }
+
+        let temp = hourly.temperature2m[safe: targetIndex]
+        let code = hourly.weatherCode[safe: targetIndex]
+        let wind = hourly.windSpeed10m[safe: targetIndex]
+        let precipitation = hourly.precipitation[safe: targetIndex]
+
+        var parts: [String] = []
+        if let code { parts.append(Self.weatherCodeDescription(for: code)) }
+        if let temp { parts.append(String(format: "%.0f°F", temp)) }
+        if let wind { parts.append(String(format: "Wind %.0f mph", wind)) }
+        if let precipitation, precipitation > 0.0 {
+            parts.append(String(format: "Precipitation %.2f in", precipitation))
+        }
+
+        return parts.isEmpty ? nil : parts.joined(separator: " | ")
+    }
+
+    private static func weatherCodeDescription(for code: Int) -> String {
+        switch code {
+        case 0: return "Clear"
+        case 1: return "Mostly Clear"
+        case 2: return "Partly Cloudy"
+        case 3: return "Overcast"
+        case 45, 48: return "Fog"
+        case 51, 53, 55, 56, 57: return "Drizzle"
+        case 61, 63, 65, 66, 67: return "Rain"
+        case 71, 73, 75, 77: return "Snow"
+        case 80, 81, 82: return "Rain Showers"
+        case 85, 86: return "Snow Showers"
+        case 95, 96, 99: return "Thunderstorm"
+        default: return "Variable Conditions"
+        }
+    }
+
     private struct SessionReportContext {
         let session: SessionReportSession
         let shots: [SessionReportShot]
@@ -565,6 +1327,48 @@ final class PDFSessionReportGenerator {
     private struct SessionReportPhotoEntry {
         let shot: SessionReportShot
         let imageURL: URL?
+    }
+
+    private struct GroupedPhotoSection {
+        let key: String
+        let title: String
+        let entries: [SessionReportPhotoEntry]
+    }
+
+    private struct PhotoChunkPlan {
+        let pageNumber: Int
+        let entries: [SessionReportPhotoEntry]
+    }
+
+    private struct PhotoSectionRenderPlan {
+        let key: String
+        let title: String
+        let entries: [SessionReportPhotoEntry]
+        let pageChunks: [PhotoChunkPlan]
+        let startPage: Int
+        let endPage: Int
+    }
+
+    private struct DocumentationIndexLine {
+        enum Kind {
+            case sectionHeader
+            case photoItem
+        }
+
+        let kind: Kind
+        let text: String
+        let pageNumber: Int?
+        let isFlagged: Bool
+    }
+
+    private struct DocumentationIndexPlacedLine {
+        let line: DocumentationIndexLine
+        let rect: CGRect
+    }
+
+    private struct DocumentationIndexPagePlan {
+        let pageIndex: Int
+        let lines: [DocumentationIndexPlacedLine]
     }
 
     private struct ImageCatalog {
@@ -786,6 +1590,22 @@ final class PDFSessionReportGenerator {
         return formatter
     }()
 
+    private static let shortDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = displayTimeZone
+        formatter.dateFormat = "MM/dd/yyyy"
+        return formatter
+    }()
+
+    private static let shortTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = displayTimeZone
+        formatter.dateFormat = "h:mm a"
+        return formatter
+    }()
+
     private static let iso8601FormatterWithFractionalSeconds: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -837,6 +1657,8 @@ private struct SessionReportShot: FetchableRecord, Decodable {
     let shotKey: String?
     let logicalShotIdentity: String?
     let capturedAtUTC: String?
+    let latitude: Double?
+    let longitude: Double?
     let originalFilename: String
     let stampedJpegFilename: String?
     let isFlagged: Int
@@ -851,10 +1673,38 @@ private struct SessionReportShot: FetchableRecord, Decodable {
         case shotKey = "shot_key"
         case logicalShotIdentity = "logical_shot_identity"
         case capturedAtUTC = "captured_at_utc"
+        case latitude
+        case longitude
         case originalFilename = "original_filename"
         case stampedJpegFilename = "stamped_jpeg_filename"
         case isFlagged = "is_flagged"
         case flaggedReason = "flagged_reason"
+    }
+}
+
+private struct OpenMeteoArchiveResponse: Decodable {
+    let hourly: OpenMeteoHourly?
+}
+
+private struct OpenMeteoHourly: Decodable {
+    let time: [String]
+    let temperature2m: [Double]
+    let weatherCode: [Int]
+    let windSpeed10m: [Double]
+    let precipitation: [Double]
+
+    enum CodingKeys: String, CodingKey {
+        case time
+        case temperature2m = "temperature_2m"
+        case weatherCode = "weather_code"
+        case windSpeed10m = "wind_speed_10m"
+        case precipitation
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
 
