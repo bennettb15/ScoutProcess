@@ -164,6 +164,7 @@ final class ScoutProcessController {
     private let stabilityInterval: TimeInterval = 0.75
     private let pollIntervalNanoseconds: UInt64 = 1_000_000_000
     private let enableSessionReportPDF = true
+    private let enableFlaggedComparisonPDF = true
     private static let supportedStampImageExtensions: Set<String> = ["heic", "jpg", "jpeg", "png"]
 
     private enum ScanAction {
@@ -551,6 +552,27 @@ final class ScoutProcessController {
                     }
                 } else {
                     log("Session report generation skipped: imported session ID was unavailable.")
+                }
+            }
+
+            if enableFlaggedComparisonPDF {
+                let resolvedSessionIDForPDF = importResult.sessionID
+                    ?? resolveSessionIDFromSessionsCSV(in: archivedSessionURL)
+                if let importedSessionID = resolvedSessionIDForPDF {
+                    do {
+                        let comparisonPDFURL = try PDFSessionReportGenerator().generateFlaggedComparisonReport(
+                            sessionID: importedSessionID,
+                            extractedFolderURL: archivedSessionURL,
+                            zipName: workingZipURL.lastPathComponent
+                        )
+                        log("Flagged comparison report created at \(comparisonPDFURL.path(percentEncoded: false))")
+                    } catch PDFSessionReportError.noFlaggedItems {
+                        log("Flagged comparison report skipped: no flagged items in session \(importedSessionID).")
+                    } catch {
+                        log("Flagged comparison report generation failed for session \(importedSessionID): \(error.localizedDescription)")
+                    }
+                } else {
+                    log("Flagged comparison report generation skipped: imported session ID was unavailable.")
                 }
             }
 

@@ -34,6 +34,7 @@ final class PDFSessionReportGenerator {
             guard let session = try SessionReportSession.fetchOne(db, sql: """
                 SELECT
                     session_id,
+                    property_id,
                     org_name,
                     folder_id,
                     property_name,
@@ -106,6 +107,136 @@ final class PDFSessionReportGenerator {
         return pdfURL
     }
 
+    func generateFlaggedComparisonReport(sessionID: String, extractedFolderURL: URL, zipName: String?) throws -> URL {
+        guard let dbQueue = databaseManager.dbQueue else {
+            throw PDFSessionReportError.databaseUnavailable
+        }
+
+        let reportContext = try dbQueue.read { db in
+            guard let session = try SessionReportSession.fetchOne(db, sql: """
+                SELECT
+                    session_id,
+                    property_id,
+                    org_name,
+                    folder_id,
+                    property_name,
+                    property_address,
+                    propertyStreet,
+                    propertyCity,
+                    propertyState,
+                    propertyZip,
+                    started_at_utc,
+                    ended_at_utc
+                FROM sessions
+                WHERE session_id = ?
+                """, arguments: [sessionID]) else {
+                throw PDFSessionReportError.sessionNotFound(sessionID)
+            }
+
+            let shots = try SessionReportShot.fetchAll(db, sql: """
+                SELECT
+                    shots.shot_id,
+                    shots.building,
+                    shots.elevation,
+                    shots.detail_type,
+                    shots.angle_index,
+                    shots.shot_key,
+                    shots.logical_shot_identity,
+                    shots.captured_at_utc,
+                    shots.latitude,
+                    shots.longitude,
+                    shots.original_filename,
+                    shots.stamped_jpeg_filename,
+                    shots.is_flagged,
+                    COALESCE(NULLIF(TRIM(shots.flagged_reason), ''), NULLIF(TRIM(issues.current_reason), '')) AS flagged_reason
+                FROM shots
+                LEFT JOIN issues ON issues.issue_id = shots.issue_id
+                WHERE shots.session_id = ?
+                ORDER BY captured_at_utc ASC, original_filename ASC
+                """, arguments: [sessionID])
+            let guidedRows = try SessionReportGuidedRow.fetchAll(db, sql: """
+                SELECT
+                    session_id,
+                    building,
+                    elevation,
+                    detail_type,
+                    angle_index,
+                    status,
+                    is_retired,
+                    retired_at,
+                    skip_reason,
+                    skip_session_id
+                FROM guided_rows
+                WHERE session_id = ?
+                ORDER BY rowid ASC
+                """, arguments: [sessionID])
+
+            return SessionReportContext(session: session, shots: shots, guidedRows: guidedRows)
+        }
+
+        let pdfFolder = try makePDFFolder(in: extractedFolderURL)
+        let pdfURL = pdfFolder.appending(path: makeFlaggedComparisonPDFFileName(for: reportContext.session))
+        let imageCatalog = ImageCatalog(sessionFolderURL: extractedFolderURL, fileManager: fileManager)
+        let propertyFolderURL = extractedFolderURL.deletingLastPathComponent()
+
+        let comparisonEntries = try dbQueue.read { db in
+            var entries: [FlaggedComparisonEntry] = []
+            let flaggedShots = reportContext.shots
+                .filter { $0.isFlagged == 1 }
+                .sorted(by: compareShotsForComparison)
+            var archivedFolderCache: [String: URL] = [:]
+
+            for currentShot in flaggedShots {
+                let currentImageURL = imageCatalog.resolveImage(for: currentShot)?.url
+                let previousShot = try fetchPreviousComparableShot(
+                    db: db,
+                    currentSession: reportContext.session,
+                    currentShot: currentShot
+                )
+                let previousImageURL = resolvePreviousImageURL(
+                    previousShot: previousShot,
+                    propertyFolderURL: propertyFolderURL,
+                    archivedFolderCache: &archivedFolderCache
+                )
+                let currentDateText = formattedUTC(currentShot.capturedAtUTC) ?? "Unknown"
+                let previousDateText = previousShot.flatMap { formattedUTC($0.capturedAtUTC) } ?? "None"
+                let currentMonthYear = monthYearUTC(currentShot.capturedAtUTC) ?? "Unknown"
+                let previousMonthYear = previousShot.flatMap { monthYearUTC($0.capturedAtUTC) } ?? "None"
+
+                entries.append(
+                    FlaggedComparisonEntry(
+                        currentShot: currentShot,
+                        currentImageURL: currentImageURL,
+                        previousShot: previousShot,
+                        previousImageURL: previousImageURL,
+                        previousMissingReason: previousShot == nil ? "NO PREVIOUS SESSION IMAGE" : nil,
+                        currentDateText: currentDateText,
+                        previousDateText: previousDateText,
+                        currentMonthYear: currentMonthYear,
+                        previousMonthYear: previousMonthYear
+                    )
+                )
+            }
+
+            return entries
+        }
+
+        if comparisonEntries.isEmpty {
+            throw PDFSessionReportError.noFlaggedItems(sessionID)
+        }
+
+        try renderFlaggedComparisonPDF(
+            context: reportContext,
+            comparisonEntries: comparisonEntries,
+            imageCatalog: imageCatalog,
+            pdfURL: pdfURL,
+            zipName: zipName
+        )
+
+        log("Flagged comparison report generated: \(pdfURL.path(percentEncoded: false))")
+        return pdfURL
+    }
+
     private func makePDFFolder(in archivedSessionFolderURL: URL) throws -> URL {
         let pdfFolderURL = archivedSessionFolderURL.appendingPathComponent("PDF", isDirectory: true)
         try fileManager.createDirectory(at: pdfFolderURL, withIntermediateDirectories: true)
@@ -117,6 +248,13 @@ final class PDFSessionReportGenerator {
         let date = Self.parseUTCDate(session.startedAtUTC) ?? Date()
         let dateString = Self.fileDateFormatter.string(from: date)
         return "Scout Property Record - \(propertyName) - \(dateString).pdf"
+    }
+
+    private func makeFlaggedComparisonPDFFileName(for session: SessionReportSession) -> String {
+        let propertyName = sanitizeFileNameComponent(session.propertyName ?? "Unknown Property")
+        let date = Self.parseUTCDate(session.startedAtUTC) ?? Date()
+        let dateString = Self.fileDateFormatter.string(from: date)
+        return "Flagged Comparison Report - \(propertyName) - \(dateString).pdf"
     }
 
     private func renderPDF(
@@ -154,7 +292,8 @@ final class PDFSessionReportGenerator {
             in: pdfContext,
             context: context,
             pageNumber: pageNumber,
-            coverImage: coverImage
+            coverImage: coverImage,
+            title: "Visual Property Record"
         )
         pdfContext.endPDFPage()
         pageNumber += 1
@@ -213,6 +352,447 @@ final class PDFSessionReportGenerator {
         }
 
         pdfContext.closePDF()
+    }
+
+    private func renderFlaggedComparisonPDF(
+        context: SessionReportContext,
+        comparisonEntries: [FlaggedComparisonEntry],
+        imageCatalog: ImageCatalog,
+        pdfURL: URL,
+        zipName _: String?
+    ) throws {
+        guard let consumer = CGDataConsumer(url: pdfURL as CFURL) else {
+            throw PDFSessionReportError.pdfContextCreationFailed(pdfURL.path)
+        }
+
+        var mediaBox = CGRect(origin: .zero, size: Self.pageSize)
+        guard let pdfContext = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw PDFSessionReportError.pdfContextCreationFailed(pdfURL.path)
+        }
+
+        let coverImage: CGImage? = {
+            guard let firstNonFlagged = context.shots.first(where: { $0.isFlagged == 0 }),
+                  let url = imageCatalog.resolveImage(for: firstNonFlagged)?.url
+            else { return nil }
+            return loadOptimizedCGImage(at: url)
+        }()
+
+        var pageNumber = 1
+        pdfContext.beginPDFPage(nil as CFDictionary?)
+        drawCoverPage(
+            in: pdfContext,
+            context: context,
+            pageNumber: pageNumber,
+            coverImage: coverImage,
+            title: "Flagged Comparison Report"
+        )
+        pdfContext.endPDFPage()
+        pageNumber += 1
+
+        pdfContext.beginPDFPage(nil as CFDictionary?)
+        drawDocumentationScopePage(in: pdfContext, context: context, pageNumber: pageNumber)
+        pdfContext.endPDFPage()
+        pageNumber += 1
+
+        let indexLines = makeFlaggedComparisonIndexLines(
+            comparisonEntries: comparisonEntries,
+            startingPage: pageNumber + 1
+        )
+        var indexPlans = makeDocumentationIndexPagePlans(from: indexLines)
+        if indexPlans.isEmpty {
+            indexPlans = [DocumentationIndexPagePlan(pageIndex: 0, lines: [])]
+        }
+
+        for plan in indexPlans {
+            pdfContext.beginPDFPage(nil as CFDictionary?)
+            drawDocumentationIndexPage(
+                in: pdfContext,
+                context: context,
+                pageNumber: pageNumber,
+                plan: plan
+            )
+            pdfContext.endPDFPage()
+            pageNumber += 1
+        }
+
+        for entry in comparisonEntries {
+            pdfContext.beginPDFPage(nil as CFDictionary?)
+            drawFlaggedComparisonPage(
+                in: pdfContext,
+                context: context,
+                entry: entry,
+                pageNumber: pageNumber
+            )
+            pdfContext.endPDFPage()
+            pageNumber += 1
+        }
+
+        pdfContext.closePDF()
+    }
+
+    private func drawFlaggedComparisonPage(
+        in pdfContext: CGContext,
+        context: SessionReportContext,
+        entry: FlaggedComparisonEntry,
+        pageNumber: Int
+    ) {
+        let bounds = CGRect(origin: .zero, size: Self.pageSize)
+        withGraphicsContext(pdfContext) {
+            NSColor.white.setFill()
+            bounds.fill()
+            drawCenteredHeaderLogo(in: bounds)
+
+            let outerMargin: CGFloat = 18
+            let footerHeight: CGFloat = 82
+            let logoHeaderReserve: CGFloat = 34
+            let photoStackVerticalOffset: CGFloat = 28
+            let photoCaptionGap: CGFloat = 8
+            let metadataHeight: CGFloat = 66
+            let slotGap: CGFloat = 2
+
+            let contentTop = bounds.height - outerMargin - logoHeaderReserve - photoStackVerticalOffset
+            let contentBottom = outerMargin + footerHeight - photoStackVerticalOffset
+            let contentHeight = contentTop - contentBottom
+            let slotHeight = (contentHeight - slotGap) / 2
+            let slotWidth = bounds.width - (outerMargin * 2)
+
+            for index in 0..<2 {
+                let slotTop = contentTop - CGFloat(index) * (slotHeight + slotGap)
+                let captionRect = CGRect(
+                    x: outerMargin,
+                    y: slotTop - slotHeight,
+                    width: slotWidth,
+                    height: metadataHeight
+                )
+                let photoAvailableRect = CGRect(
+                    x: outerMargin,
+                    y: captionRect.maxY + photoCaptionGap,
+                    width: slotWidth,
+                    height: slotHeight - metadataHeight - photoCaptionGap
+                )
+
+                if index == 0 {
+                    drawComparisonImage(
+                        imageURL: entry.currentImageURL,
+                        placeholderReason: "IMAGE UNAVAILABLE",
+                        in: photoAvailableRect,
+                        context: pdfContext
+                    )
+                    drawComparisonMetadata(
+                        identityLine: captionIdentityLine(for: entry.currentShot),
+                        sessionLine: "Current Session: \(entry.currentDateText)",
+                        flaggedReason: entry.currentShot.flaggedReason,
+                        in: captionRect
+                    )
+                } else {
+                    let placeholderReason = entry.previousMissingReason ?? "IMAGE UNAVAILABLE"
+                    drawComparisonImage(
+                        imageURL: entry.previousImageURL,
+                        placeholderReason: placeholderReason,
+                        in: photoAvailableRect,
+                        context: pdfContext
+                    )
+                    drawComparisonMetadata(
+                        identityLine: captionIdentityLine(
+                            building: entry.currentShot.building,
+                            elevation: entry.currentShot.elevation,
+                            detailType: entry.currentShot.detailType,
+                            shotKey: entry.currentShot.shotKey,
+                            angleIndex: entry.currentShot.angleIndex
+                        ),
+                        sessionLine: "Previous Session: \(entry.previousDateText)",
+                        flaggedReason: entry.previousShot?.flaggedReason,
+                        in: captionRect
+                    )
+                }
+            }
+
+            drawAddressFooter(
+                pageNumber: pageNumber,
+                in: bounds,
+                address: formattedAddress(for: context.session)
+            )
+        }
+    }
+
+    private func drawComparisonImage(
+        imageURL: URL?,
+        placeholderReason: String,
+        in rect: CGRect,
+        context: CGContext
+    ) {
+        if let imageURL, let image = loadOptimizedCGImage(at: imageURL) {
+            let fittedRect = aspectFitRect(for: image, in: rect)
+            context.saveGState()
+            let clipPath = NSBezierPath(roundedRect: fittedRect, xRadius: 12, yRadius: 12)
+            clipPath.addClip()
+            context.draw(image, in: fittedRect)
+            context.restoreGState()
+            drawFlaggedBorder(around: fittedRect, in: context)
+        } else {
+            let placeholderRect = aspectFitRect(
+                for: CGSize(width: 4, height: 3),
+                in: rect
+            )
+            drawSkippedPlaceholder(
+                reason: placeholderReason,
+                in: placeholderRect,
+                context: context
+            )
+        }
+    }
+
+    private func drawComparisonMetadata(
+        identityLine: String,
+        sessionLine: String,
+        flaggedReason: String?,
+        in rect: CGRect
+    ) {
+        let titleFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        let bodyFont = NSFont.systemFont(ofSize: 10, weight: .regular)
+        let lineHeight: CGFloat = 14
+        let topY = rect.maxY - lineHeight
+
+        drawText(
+            identityLine,
+            in: CGRect(x: rect.minX, y: topY, width: rect.width, height: lineHeight),
+            font: titleFont,
+            alignment: .center
+        )
+        let trimmedReason = flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedReason, trimmedReason.isEmpty == false {
+            drawFlaggedNote(
+                text: trimmedReason,
+                in: CGRect(x: rect.minX, y: topY - lineHeight, width: rect.width, height: lineHeight),
+                font: bodyFont,
+                alignment: .center
+            )
+            drawText(
+                sessionLine,
+                in: CGRect(x: rect.minX, y: topY - (lineHeight * 2), width: rect.width, height: lineHeight),
+                font: bodyFont,
+                alignment: .center
+            )
+        } else {
+            drawText(
+                sessionLine,
+                in: CGRect(x: rect.minX, y: topY - lineHeight, width: rect.width, height: lineHeight),
+                font: bodyFont,
+                alignment: .center
+            )
+        }
+    }
+
+    private func makeFlaggedComparisonIndexLines(
+        comparisonEntries: [FlaggedComparisonEntry],
+        startingPage: Int
+    ) -> [DocumentationIndexLine] {
+        var lines: [DocumentationIndexLine] = []
+        lines.append(DocumentationIndexLine(kind: .sectionHeader, text: "Flagged Items", pageNumber: nil, isFlagged: false))
+
+        for (index, entry) in comparisonEntries.enumerated() {
+            let page = startingPage + index
+            let text = "\(captionIdentityLine(for: entry.currentShot)) | \(entry.currentMonthYear) vs \(entry.previousMonthYear)"
+            lines.append(
+                DocumentationIndexLine(
+                    kind: .photoItem,
+                    text: text,
+                    pageNumber: page,
+                    isFlagged: true
+                )
+            )
+        }
+        return lines
+    }
+
+    private func makeDocumentationIndexPagePlans(from lines: [DocumentationIndexLine]) -> [DocumentationIndexPagePlan] {
+        if lines.isEmpty { return [] }
+        let leftMargin: CGFloat = 64
+        let rightMargin: CGFloat = 64
+        let topY: CGFloat = Self.pageSize.height - 106
+        let bottomY: CGFloat = 96
+        let usableWidth = Self.pageSize.width - leftMargin - rightMargin
+
+        var pages: [DocumentationIndexPagePlan] = []
+        var pageIndex = 0
+        var cursorY = topY
+        var placedLines: [DocumentationIndexPlacedLine] = []
+
+        func commitPageIfNeeded() {
+            if placedLines.isEmpty == false {
+                pages.append(DocumentationIndexPagePlan(pageIndex: pageIndex, lines: placedLines))
+                placedLines = []
+            }
+        }
+
+        for line in lines {
+            let lineHeight: CGFloat = (line.kind == .sectionHeader) ? 18 : 15
+            let lineSpacing: CGFloat = (line.kind == .sectionHeader) ? 8 : 3
+
+            if cursorY - lineHeight < bottomY {
+                commitPageIfNeeded()
+                pageIndex += 1
+                cursorY = topY
+            }
+
+            let lineRect = CGRect(x: leftMargin, y: cursorY - lineHeight, width: usableWidth, height: lineHeight)
+            placedLines.append(DocumentationIndexPlacedLine(line: line, rect: lineRect))
+            cursorY -= (lineHeight + lineSpacing)
+        }
+
+        commitPageIfNeeded()
+        return pages
+    }
+
+    private func compareShotsForComparison(_ lhs: SessionReportShot, _ rhs: SessionReportShot) -> Bool {
+        let lhsKey = comparisonSortTuple(for: lhs)
+        let rhsKey = comparisonSortTuple(for: rhs)
+        return lhsKey.lexicographicallyPrecedes(rhsKey, by: <)
+    }
+
+    private func comparisonSortTuple(for shot: SessionReportShot) -> [String] {
+        [
+            friendlyBuildingLabel(displayText(shot.building, fallback: "B1")).uppercased(),
+            displayText(shot.elevation, fallback: "Unknown").uppercased(),
+            displayText(shot.detailType, fallback: "General Elevation").uppercased(),
+            String(format: "%05d", shot.angleIndex ?? 0),
+            shot.capturedAtUTC ?? "",
+            shot.originalFilename,
+        ]
+    }
+
+    private func fetchPreviousComparableShot(
+        db: Database,
+        currentSession: SessionReportSession,
+        currentShot: SessionReportShot
+    ) throws -> PreviousComparableShot? {
+        guard let propertyID = currentSession.propertyID else { return nil }
+
+        return try PreviousComparableShot.fetchOne(db, sql: """
+            SELECT
+                shots.session_id,
+                shots.shot_id,
+                shots.building,
+                shots.elevation,
+                shots.detail_type,
+                shots.angle_index,
+                shots.shot_key,
+                shots.captured_at_utc,
+                shots.original_filename,
+                shots.stamped_jpeg_filename,
+                COALESCE(
+                    NULLIF(TRIM(shots.flagged_reason), ''),
+                    NULLIF(TRIM(issues.previous_reason), ''),
+                    NULLIF(TRIM(issues.current_reason), '')
+                ) AS flagged_reason
+            FROM shots
+            JOIN sessions ON sessions.session_id = shots.session_id
+            LEFT JOIN issues ON issues.issue_id = shots.issue_id
+            WHERE sessions.property_id = ?
+              AND sessions.started_at_utc < ?
+              AND UPPER(COALESCE(shots.building, '')) = UPPER(COALESCE(?, ''))
+              AND UPPER(COALESCE(shots.elevation, '')) = UPPER(COALESCE(?, ''))
+              AND UPPER(COALESCE(shots.detail_type, '')) = UPPER(COALESCE(?, ''))
+              AND COALESCE(shots.angle_index, -1) = COALESCE(?, -1)
+            ORDER BY sessions.started_at_utc DESC, shots.captured_at_utc DESC
+            LIMIT 1
+            """, arguments: [
+            propertyID,
+            currentSession.startedAtUTC,
+            currentShot.building,
+            currentShot.elevation,
+            currentShot.detailType,
+            currentShot.angleIndex,
+        ])
+    }
+
+    private func resolvePreviousImageURL(
+        previousShot: PreviousComparableShot?,
+        propertyFolderURL: URL,
+        archivedFolderCache: inout [String: URL]
+    ) -> URL? {
+        guard let previousShot else { return nil }
+        let sessionFolder: URL
+        if let cached = archivedFolderCache[previousShot.sessionID] {
+            sessionFolder = cached
+        } else {
+            guard let found = findArchivedSessionFolder(
+                sessionID: previousShot.sessionID,
+                propertyFolderURL: propertyFolderURL
+            ) else {
+                return nil
+            }
+            archivedFolderCache[previousShot.sessionID] = found
+            sessionFolder = found
+        }
+
+        if let stamped = previousShot.stampedJpegFilename, stamped.isEmpty == false {
+            let stampedURL = sessionFolder.appending(path: "Stamped", directoryHint: .isDirectory).appending(path: stamped)
+            if fileManager.fileExists(atPath: stampedURL.path) {
+                return stampedURL
+            }
+        }
+
+        let originalURL = sessionFolder.appending(path: "Originals", directoryHint: .isDirectory).appending(path: previousShot.originalFilename)
+        if fileManager.fileExists(atPath: originalURL.path) {
+            return originalURL
+        }
+        return nil
+    }
+
+    private func findArchivedSessionFolder(sessionID: String, propertyFolderURL: URL) -> URL? {
+        let folders = (try? fileManager.contentsOfDirectory(
+            at: propertyFolderURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        for folder in folders {
+            guard (try? folder.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+            let sessionsCSVURL = folder.appending(path: "sessions.csv")
+            guard let data = try? Data(contentsOf: sessionsCSVURL),
+                  let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii)
+            else { continue }
+            let lines = text.split(whereSeparator: \.isNewline).map(String.init)
+            guard lines.count >= 2 else { continue }
+            let header = parseCSVLine(lines[0]).map { $0.lowercased() }
+            guard let sessionIDIndex = header.firstIndex(of: "session_id") else { continue }
+            let values = parseCSVLine(lines[1])
+            if values.indices.contains(sessionIDIndex),
+               values[sessionIDIndex].trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(sessionID) == .orderedSame {
+                return folder
+            }
+        }
+
+        return nil
+    }
+
+    private func parseCSVLine(_ line: String) -> [String] {
+        var values: [String] = []
+        var current = ""
+        var inQuotes = false
+        var index = line.startIndex
+
+        while index < line.endIndex {
+            let char = line[index]
+            if char == "\"" {
+                let next = line.index(after: index)
+                if inQuotes, next < line.endIndex, line[next] == "\"" {
+                    current.append("\"")
+                    index = line.index(after: next)
+                    continue
+                }
+                inQuotes.toggle()
+            } else if char == ",", inQuotes == false {
+                values.append(current)
+                current = ""
+            } else {
+                current.append(char)
+            }
+            index = line.index(after: index)
+        }
+        values.append(current)
+        return values
     }
 
     private func preparePhotoEntries(
@@ -490,7 +1070,8 @@ final class PDFSessionReportGenerator {
         in pdfContext: CGContext,
         context: SessionReportContext,
         pageNumber: Int,
-        coverImage: CGImage?
+        coverImage: CGImage?,
+        title: String
     ) {
         let bounds = CGRect(origin: .zero, size: Self.pageSize)
         withGraphicsContext(pdfContext) {
@@ -537,7 +1118,7 @@ final class PDFSessionReportGenerator {
             }
 
             drawText(
-                "Visual Property Record",
+                title,
                 in: CGRect(x: horizontalMargin, y: imageRect.minY - 54, width: bounds.width - (horizontalMargin * 2), height: 28),
                 font: .systemFont(ofSize: 20, weight: .bold),
                 color: .black,
@@ -1720,6 +2301,18 @@ final class PDFSessionReportGenerator {
         let guidedRows: [SessionReportGuidedRow]
     }
 
+    private struct FlaggedComparisonEntry {
+        let currentShot: SessionReportShot
+        let currentImageURL: URL?
+        let previousShot: PreviousComparableShot?
+        let previousImageURL: URL?
+        let previousMissingReason: String?
+        let currentDateText: String
+        let previousDateText: String
+        let currentMonthYear: String
+        let previousMonthYear: String
+    }
+
     private struct SessionReportPhotoEntry {
         let shot: SessionReportShot?
         let guidedRow: SessionReportGuidedRow?
@@ -2036,6 +2629,14 @@ final class PDFSessionReportGenerator {
         return formatter
     }()
 
+    private static let monthYearFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = displayTimeZone
+        formatter.dateFormat = "MMMM yyyy"
+        return formatter
+    }()
+
     private static let iso8601FormatterWithFractionalSeconds: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -2048,10 +2649,16 @@ final class PDFSessionReportGenerator {
         }
         return ISO8601DateFormatter().date(from: rawValue)
     }
+
+    private func monthYearUTC(_ rawValue: String?) -> String? {
+        guard let rawValue, let date = Self.parseUTCDate(rawValue) else { return nil }
+        return Self.monthYearFormatter.string(from: date)
+    }
 }
 
 private struct SessionReportSession: FetchableRecord, Decodable {
     let sessionID: String
+    let propertyID: String?
     let orgName: String?
     let folderID: String?
     let propertyName: String?
@@ -2065,6 +2672,7 @@ private struct SessionReportSession: FetchableRecord, Decodable {
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
+        case propertyID = "property_id"
         case orgName = "org_name"
         case folderID = "folder_id"
         case propertyName = "property_name"
@@ -2201,6 +2809,34 @@ private struct SessionReportGuidedRow: FetchableRecord, Decodable {
     }
 }
 
+private struct PreviousComparableShot: FetchableRecord, Decodable {
+    let sessionID: String
+    let shotID: String
+    let building: String?
+    let elevation: String?
+    let detailType: String?
+    let angleIndex: Int?
+    let shotKey: String?
+    let capturedAtUTC: String?
+    let originalFilename: String
+    let stampedJpegFilename: String?
+    let flaggedReason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case shotID = "shot_id"
+        case building
+        case elevation
+        case detailType = "detail_type"
+        case angleIndex = "angle_index"
+        case shotKey = "shot_key"
+        case capturedAtUTC = "captured_at_utc"
+        case originalFilename = "original_filename"
+        case stampedJpegFilename = "stamped_jpeg_filename"
+        case flaggedReason = "flagged_reason"
+    }
+}
+
 private struct OpenMeteoArchiveResponse: Decodable {
     let hourly: OpenMeteoHourly?
 }
@@ -2230,6 +2866,7 @@ private extension Array {
 enum PDFSessionReportError: LocalizedError {
     case databaseUnavailable
     case sessionNotFound(String)
+    case noFlaggedItems(String)
     case pdfContextCreationFailed(String)
 
     var errorDescription: String? {
@@ -2238,6 +2875,8 @@ enum PDFSessionReportError: LocalizedError {
             return "Database is unavailable."
         case .sessionNotFound(let sessionID):
             return "Session \(sessionID) was not found in the database."
+        case .noFlaggedItems(let sessionID):
+            return "Session \(sessionID) has no flagged items."
         case .pdfContextCreationFailed(let path):
             return "Unable to create PDF context for \(path)."
         }
