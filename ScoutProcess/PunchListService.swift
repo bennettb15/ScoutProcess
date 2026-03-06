@@ -488,7 +488,31 @@ final class PunchListService {
                     s.captured_at_utc,
                     s.stamped_jpeg_filename,
                     s.is_flagged,
-                    s.flagged_reason,
+                    COALESCE(
+                        NULLIF(TRIM(s.flagged_reason), ''),
+                        NULLIF(TRIM((
+                            SELECT pli.flagged_reason
+                            FROM punch_list_items pli
+                            WHERE pli.session_id = s.session_id
+                              AND COALESCE(pli.property_id, '') = COALESCE(s.property_id, '')
+                              AND LOWER(TRIM(COALESCE(pli.building, ''))) = LOWER(TRIM(COALESCE(s.building, '')))
+                              AND LOWER(TRIM(COALESCE(pli.elevation, ''))) = LOWER(TRIM(COALESCE(s.elevation, '')))
+                              AND LOWER(TRIM(COALESCE(pli.detail_type, ''))) = LOWER(TRIM(COALESCE(s.detail_type, '')))
+                              AND COALESCE(pli.angle_index, -1) = COALESCE(s.angle_index, -1)
+                            ORDER BY COALESCE(pli.updated_at_utc, '') DESC, pli.id DESC
+                            LIMIT 1
+                        )), ''),
+                        NULLIF(TRIM((
+                            SELECT ih.new_value
+                            FROM issue_history ih
+                            WHERE ih.issue_id = s.issue_id
+                              AND ih.session_id = s.session_id
+                              AND LOWER(TRIM(COALESCE(ih.field_changed, ''))) IN ('current_reason', 'reason', 'flagged_reason')
+                            ORDER BY COALESCE(ih.timestamp_utc, '') DESC
+                            LIMIT 1
+                        )), ''),
+                        NULLIF(TRIM(i.current_reason), '')
+                    ) AS flagged_reason,
                     i.current_status AS issue_status,
                     i.resolved_at_utc AS issue_resolved_at_utc
                 FROM shots s

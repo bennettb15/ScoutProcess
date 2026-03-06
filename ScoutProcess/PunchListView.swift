@@ -2323,6 +2323,18 @@ private struct ShotGallerySheet: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                    HStack(spacing: 6) {
+                        Image(systemName: "flag.fill")
+                            .foregroundStyle(.red)
+                        Text(
+                            selectedShot.flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                            ? selectedShot.flaggedReason!
+                            : "Flagged"
+                        )
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+
                     ScrollView(.horizontal) {
                         HStack(spacing: 10) {
                             ForEach(Array(shots.enumerated()), id: \.offset) { index, shot in
