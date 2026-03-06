@@ -522,7 +522,12 @@ final class ScoutProcessController {
             )
 
             if enableSessionReportPDF {
-                if let importedSessionID = importResult.sessionID {
+                let resolvedSessionIDForPDF = importResult.sessionID
+                    ?? resolveSessionIDFromSessionsCSV(in: archivedSessionURL)
+                if let importedSessionID = resolvedSessionIDForPDF {
+                    if importResult.sessionID == nil {
+                        log("Session report fallback: using session ID from sessions.csv: \(importedSessionID)")
+                    }
                     do {
                         let pdfURL = try PDFSessionReportGenerator().generateSessionReport(
                             sessionID: importedSessionID,
@@ -1259,6 +1264,70 @@ final class ScoutProcessController {
                 )
             }
         }
+    }
+
+    private func resolveSessionIDFromSessionsCSV(in sessionFolderURL: URL) -> String? {
+        let sessionsCSVURL = sessionFolderURL.appending(path: "sessions.csv")
+        guard let data = try? Data(contentsOf: sessionsCSVURL),
+              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii)
+        else {
+            return nil
+        }
+
+        let lines = text
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }
+        guard lines.count >= 2 else { return nil }
+
+        let header = parseCSVLine(lines[0]).map { canonicalCSVKey($0) }
+        guard let sessionIDIndex = header.firstIndex(of: "session_id") else { return nil }
+
+        for line in lines.dropFirst() {
+            let values = parseCSVLine(line)
+            guard values.indices.contains(sessionIDIndex) else { continue }
+            let sessionID = values[sessionIDIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+            if sessionID.isEmpty == false {
+                return sessionID
+            }
+        }
+        return nil
+    }
+
+    private func canonicalCSVKey(_ raw: String) -> String {
+        raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\u{feff}", with: "")
+            .lowercased()
+    }
+
+    private func parseCSVLine(_ line: String) -> [String] {
+        var values: [String] = []
+        var current = ""
+        var inQuotes = false
+        var index = line.startIndex
+
+        while index < line.endIndex {
+            let char = line[index]
+            if char == "\"" {
+                let next = line.index(after: index)
+                if inQuotes, next < line.endIndex, line[next] == "\"" {
+                    current.append("\"")
+                    index = line.index(after: next)
+                    continue
+                }
+                inQuotes.toggle()
+            } else if char == ",", inQuotes == false {
+                values.append(current)
+                current = ""
+            } else {
+                current.append(char)
+            }
+            index = line.index(after: index)
+        }
+
+        values.append(current)
+        return values
     }
 
     private func fingerprint(for url: URL) throws -> String {

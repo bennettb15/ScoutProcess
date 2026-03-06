@@ -189,29 +189,32 @@ final class CSVImportService {
 
         let sessionsFile = try parseCSVFile(at: sessionsCSV)
 
-        let firstSessionID = sessionsFile.rows.first.flatMap {
-            value(for: "session_id", in: $0, aliases: Self.sessionAliases)
+        let firstUsableSessionRow = sessionsFile.rows.first { row in
+            value(for: "session_id", in: row, aliases: Self.sessionAliases) != nil
+                && value(for: "property_id", in: row, aliases: Self.sessionAliases) != nil
         }
 
-        guard let sessionID = firstSessionID else {
+        guard let sessionID = firstUsableSessionRow.flatMap({
+            value(for: "session_id", in: $0, aliases: Self.sessionAliases)
+        }) else {
             return ImportResult(
                 status: .skipped,
                 sessionID: nil,
                 zipName: detectedZipName,
-                errorMessage: "sessions.csv has no usable session_id in the first data row.",
+                errorMessage: "sessions.csv has no usable session_id in any data row.",
                 rowCounts: .zero,
                 qualitySummary: nil
             )
         }
 
-        guard let sessionPropertyID = sessionsFile.rows.first.flatMap({
+        guard let sessionPropertyID = firstUsableSessionRow.flatMap({
             value(for: "property_id", in: $0, aliases: Self.sessionAliases)
         }) else {
             return ImportResult(
                 status: .skipped,
                 sessionID: sessionID,
                 zipName: detectedZipName,
-                errorMessage: "sessions.csv has no usable property_id in the first data row.",
+                errorMessage: "sessions.csv has no usable property_id in any data row.",
                 rowCounts: .zero,
                 qualitySummary: nil
             )
@@ -549,6 +552,7 @@ final class CSVImportService {
         defaultPropertyID: String
     ) throws -> Int {
         var upsertedCount = 0
+        var skippedShotIDConflictCount = 0
 
         for row in file.rows {
             guard let shotID = value(for: "shot_id", in: row, aliases: Self.shotAliases),
@@ -564,94 +568,102 @@ final class CSVImportService {
                 throw CSVImportError.mismatchedShotSessionID(shotID: shotID, sessionID: rowSessionID, expectedSessionID: sessionID)
             }
 
-            try db.execute(
-                sql: """
-                INSERT INTO shots (
-                    shot_id,
-                    session_id,
-                    property_id,
-                    propertyStreet,
-                    propertyCity,
-                    propertyState,
-                    propertyZip,
-                    building,
-                    elevation,
-                    detail_type,
-                    angle_index,
-                    shot_key,
-                    logical_shot_identity,
-                    capture_kind,
-                    is_flagged,
-                    is_guided,
-                    issue_id,
-                    captured_at_utc,
-                    latitude,
-                    longitude,
-                    lens,
-                    original_filename,
-                    original_byte_size,
-                    stamped_jpeg_filename,
-                    flagged_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id, logical_shot_identity) DO UPDATE SET
-                    shot_id = excluded.shot_id,
-                    session_id = excluded.session_id,
-                    property_id = excluded.property_id,
-                    propertyStreet = excluded.propertyStreet,
-                    propertyCity = excluded.propertyCity,
-                    propertyState = excluded.propertyState,
-                    propertyZip = excluded.propertyZip,
-                    building = excluded.building,
-                    elevation = excluded.elevation,
-                    detail_type = excluded.detail_type,
-                    angle_index = excluded.angle_index,
-                    shot_key = excluded.shot_key,
-                    logical_shot_identity = excluded.logical_shot_identity,
-                    capture_kind = excluded.capture_kind,
-                    is_flagged = excluded.is_flagged,
-                    is_guided = excluded.is_guided,
-                    issue_id = excluded.issue_id,
-                    captured_at_utc = excluded.captured_at_utc,
-                    latitude = excluded.latitude,
-                    longitude = excluded.longitude,
-                    lens = excluded.lens,
-                    original_filename = excluded.original_filename,
-                    original_byte_size = excluded.original_byte_size,
-                    stamped_jpeg_filename = excluded.stamped_jpeg_filename,
-                    flagged_reason = excluded.flagged_reason
-                """,
-                arguments: [
-                    shotID,
-                    rowSessionID,
-                    propertyID,
-                    optionalValue(for: "propertyStreet", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "propertyCity", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "propertyState", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "propertyZip", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "building", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "elevation", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "detail_type", in: row, aliases: Self.shotAliases),
-                    integerValue(for: "angle_index", in: row, aliases: Self.shotAliases),
-                    shotKey,
-                    logicalShotIdentity,
-                    optionalValue(for: "capture_kind", in: row, aliases: Self.shotAliases),
-                    boolIntegerValue(for: "is_flagged", in: row, aliases: Self.shotAliases, defaultValue: 0),
-                    boolIntegerValue(for: "is_guided", in: row, aliases: Self.shotAliases, defaultValue: 0),
-                    optionalValue(for: "issue_id", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "captured_at_utc", in: row, aliases: Self.shotAliases),
-                    doubleValue(for: "latitude", in: row, aliases: Self.shotAliases),
-                    doubleValue(for: "longitude", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "lens", in: row, aliases: Self.shotAliases),
-                    fileName,
-                    integerValue(for: "original_byte_size", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "stamped_jpeg_filename", in: row, aliases: Self.shotAliases),
-                    optionalValue(for: "flagged_reason", in: row, aliases: Self.shotAliases),
-                ]
-            )
-            upsertedCount += 1
+            do {
+                try db.execute(
+                    sql: """
+                    INSERT INTO shots (
+                        shot_id,
+                        session_id,
+                        property_id,
+                        propertyStreet,
+                        propertyCity,
+                        propertyState,
+                        propertyZip,
+                        building,
+                        elevation,
+                        detail_type,
+                        angle_index,
+                        shot_key,
+                        logical_shot_identity,
+                        capture_kind,
+                        is_flagged,
+                        is_guided,
+                        issue_id,
+                        captured_at_utc,
+                        latitude,
+                        longitude,
+                        lens,
+                        original_filename,
+                        original_byte_size,
+                        stamped_jpeg_filename,
+                        flagged_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, logical_shot_identity) DO UPDATE SET
+                        shot_id = excluded.shot_id,
+                        session_id = excluded.session_id,
+                        property_id = excluded.property_id,
+                        propertyStreet = excluded.propertyStreet,
+                        propertyCity = excluded.propertyCity,
+                        propertyState = excluded.propertyState,
+                        propertyZip = excluded.propertyZip,
+                        building = excluded.building,
+                        elevation = excluded.elevation,
+                        detail_type = excluded.detail_type,
+                        angle_index = excluded.angle_index,
+                        shot_key = excluded.shot_key,
+                        logical_shot_identity = excluded.logical_shot_identity,
+                        capture_kind = excluded.capture_kind,
+                        is_flagged = excluded.is_flagged,
+                        is_guided = excluded.is_guided,
+                        issue_id = excluded.issue_id,
+                        captured_at_utc = excluded.captured_at_utc,
+                        latitude = excluded.latitude,
+                        longitude = excluded.longitude,
+                        lens = excluded.lens,
+                        original_filename = excluded.original_filename,
+                        original_byte_size = excluded.original_byte_size,
+                        stamped_jpeg_filename = excluded.stamped_jpeg_filename,
+                        flagged_reason = excluded.flagged_reason
+                    """,
+                    arguments: [
+                        shotID,
+                        rowSessionID,
+                        propertyID,
+                        optionalValue(for: "propertyStreet", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "propertyCity", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "propertyState", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "propertyZip", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "building", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "elevation", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "detail_type", in: row, aliases: Self.shotAliases),
+                        integerValue(for: "angle_index", in: row, aliases: Self.shotAliases),
+                        shotKey,
+                        logicalShotIdentity,
+                        optionalValue(for: "capture_kind", in: row, aliases: Self.shotAliases),
+                        boolIntegerValue(for: "is_flagged", in: row, aliases: Self.shotAliases, defaultValue: 0),
+                        boolIntegerValue(for: "is_guided", in: row, aliases: Self.shotAliases, defaultValue: 0),
+                        optionalValue(for: "issue_id", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "captured_at_utc", in: row, aliases: Self.shotAliases),
+                        doubleValue(for: "latitude", in: row, aliases: Self.shotAliases),
+                        doubleValue(for: "longitude", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "lens", in: row, aliases: Self.shotAliases),
+                        fileName,
+                        integerValue(for: "original_byte_size", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "stamped_jpeg_filename", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "flagged_reason", in: row, aliases: Self.shotAliases),
+                    ]
+                )
+                upsertedCount += 1
+            } catch let error as DatabaseError
+                where error.resultCode == .SQLITE_CONSTRAINT
+                && (error.message?.contains("shots.shot_id") == true || error.description.contains("shots.shot_id")) {
+                skippedShotIDConflictCount += 1
+                log("ImportRun \(importRunID) shots skip shot_id=\(shotID) reason=duplicate_shot_id_across_sessions")
+                continue
+            }
         }
 
-        log("ImportRun \(importRunID) shots parsed=\(file.stats.parsedRows) skippedMalformed=\(file.stats.skippedMalformedRows) upserted=\(upsertedCount)")
+        log("ImportRun \(importRunID) shots parsed=\(file.stats.parsedRows) skippedMalformed=\(file.stats.skippedMalformedRows) skippedShotIDConflict=\(skippedShotIDConflictCount) upserted=\(upsertedCount)")
         return upsertedCount
     }
 

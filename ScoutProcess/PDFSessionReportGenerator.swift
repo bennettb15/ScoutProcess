@@ -71,8 +71,24 @@ final class PDFSessionReportGenerator {
                 WHERE shots.session_id = ?
                 ORDER BY captured_at_utc ASC, original_filename ASC
                 """, arguments: [sessionID])
+            let guidedRows = try SessionReportGuidedRow.fetchAll(db, sql: """
+                SELECT
+                    session_id,
+                    building,
+                    elevation,
+                    detail_type,
+                    angle_index,
+                    status,
+                    is_retired,
+                    retired_at,
+                    skip_reason,
+                    skip_session_id
+                FROM guided_rows
+                WHERE session_id = ?
+                ORDER BY rowid ASC
+                """, arguments: [sessionID])
 
-            return SessionReportContext(session: session, shots: shots)
+            return SessionReportContext(session: session, shots: shots, guidedRows: guidedRows)
         }
 
         let pdfFolder = try makePDFFolder(in: extractedFolderURL)
@@ -118,16 +134,19 @@ final class PDFSessionReportGenerator {
             throw PDFSessionReportError.pdfContextCreationFailed(pdfURL.path)
         }
 
-        let photoEntries = context.shots.map { shot in
-            let resolvedImage = imageCatalog.resolveImage(for: shot)
-            if resolvedImage == nil {
-                log("Session report warning: missing image for shot \(shot.shotID) (\(shot.originalFilename))")
-            }
-            return SessionReportPhotoEntry(shot: shot, imageURL: resolvedImage?.url)
-        }
-        let groupedPhotoSections = makeGroupedPhotoSections(from: photoEntries)
-        let coverImageURL = photoEntries.first(where: { $0.imageURL != nil })?.imageURL
-        let coverImage = coverImageURL.flatMap { loadOptimizedCGImage(at: $0) }
+        let preparedEntries = preparePhotoEntries(context: context, imageCatalog: imageCatalog)
+        let photoEntries = preparedEntries.entries
+        let groupedPhotoSections = makeGroupedPhotoSections(
+            from: photoEntries,
+            retiredNotesBySection: preparedEntries.retiredNotesBySection
+        )
+        let coverImage: CGImage? = {
+            guard let firstEntry = photoEntries.first else { return nil }
+            guard firstEntry.isSkipped == false else { return nil }
+            guard resolvedAngleIndex(for: firstEntry) == 1 else { return nil }
+            guard let coverImageURL = firstEntry.imageURL else { return nil }
+            return loadOptimizedCGImage(at: coverImageURL)
+        }()
 
         var pageNumber = 1
         pdfContext.beginPDFPage(nil as CFDictionary?)
@@ -196,15 +215,107 @@ final class PDFSessionReportGenerator {
         pdfContext.closePDF()
     }
 
-    private func makeGroupedPhotoSections(from entries: [SessionReportPhotoEntry]) -> [GroupedPhotoSection] {
+    private func preparePhotoEntries(
+        context: SessionReportContext,
+        imageCatalog: ImageCatalog
+    ) -> PreparedPhotoEntries {
+        var retiredSlotKeys = Set<String>()
+        var retiredNotesBySection: [String: [String]] = [:]
+        var skippedRowsBySlotKey: [String: SessionReportGuidedRow] = [:]
+
+        for guidedRow in context.guidedRows {
+            let slotKey = slotKey(
+                building: guidedRow.building,
+                elevation: guidedRow.elevation,
+                detailType: guidedRow.detailType,
+                shotKey: nil,
+                angleIndex: guidedRow.angleIndex
+            )
+            let sectionKey = sectionGroupingKey(building: guidedRow.building, elevation: guidedRow.elevation)
+            let retiredInCurrentSession = guidedRow.wasRetiredDuringSession(
+                sessionStartedAtUTC: context.session.startedAtUTC,
+                sessionEndedAtUTC: context.session.endedAtUTC
+            )
+            if guidedRow.isRetired, retiredInCurrentSession {
+                retiredSlotKeys.insert(slotKey)
+                let retiredNote = "Retired: \(captionIdentityLine(for: guidedRow)) was retired in this session."
+                if retiredNotesBySection[sectionKey]?.contains(retiredNote) != true {
+                    retiredNotesBySection[sectionKey, default: []].append(retiredNote)
+                }
+                continue
+            }
+
+            let trimmedSkipReason = guidedRow.skipReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hasSkipReason = trimmedSkipReason?.isEmpty == false
+            let isSkipForSession = (guidedRow.skipSessionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? context.session.sessionID) == context.session.sessionID
+            if hasSkipReason && isSkipForSession {
+                skippedRowsBySlotKey[slotKey] = guidedRow
+            }
+        }
+
+        var entries: [SessionReportPhotoEntry] = context.shots.compactMap { shot in
+            let computedSlotKey = slotKey(
+                building: shot.building,
+                elevation: shot.elevation,
+                detailType: shot.detailType,
+                shotKey: shot.shotKey,
+                angleIndex: shot.angleIndex
+            )
+            if retiredSlotKeys.contains(computedSlotKey) {
+                return nil
+            }
+            let resolvedImage = imageCatalog.resolveImage(for: shot)
+            if resolvedImage == nil {
+                log("Session report warning: missing image for shot \(shot.shotID) (\(shot.originalFilename))")
+            }
+            return SessionReportPhotoEntry(shot: shot, imageURL: resolvedImage?.url)
+        }
+
+        let slotsWithShots = Set(entries.map { entry in
+            slotKey(
+                building: entry.building,
+                elevation: entry.elevation,
+                detailType: entry.detailType,
+                shotKey: entry.shotKey,
+                angleIndex: entry.angleIndex
+            )
+        })
+
+        for guidedRow in context.guidedRows {
+            let rowSlotKey = slotKey(
+                building: guidedRow.building,
+                elevation: guidedRow.elevation,
+                detailType: guidedRow.detailType,
+                shotKey: nil,
+                angleIndex: guidedRow.angleIndex
+            )
+            if retiredSlotKeys.contains(rowSlotKey) {
+                continue
+            }
+
+            if slotsWithShots.contains(rowSlotKey) == false,
+               let skippedRow = skippedRowsBySlotKey[rowSlotKey] {
+                entries.append(SessionReportPhotoEntry(skippedGuidedRow: skippedRow))
+            }
+        }
+
+        entries.sort(by: comparePhotoEntries)
+
+        return PreparedPhotoEntries(entries: entries, retiredNotesBySection: retiredNotesBySection)
+    }
+
+    private func makeGroupedPhotoSections(
+        from entries: [SessionReportPhotoEntry],
+        retiredNotesBySection: [String: [String]]
+    ) -> [GroupedPhotoSection] {
         var orderedKeys: [String] = []
         var groupedEntries: [String: [SessionReportPhotoEntry]] = [:]
         var groupedMeta: [String: (building: String, elevation: String)] = [:]
 
         for entry in entries {
-            let building = friendlyBuildingLabel(displayText(entry.shot.building, fallback: "Building"))
-            let elevation = displayText(entry.shot.elevation, fallback: "Unknown")
-            let key = "\(building.uppercased())|\(elevation.uppercased())"
+            let building = friendlyBuildingLabel(displayText(entry.building, fallback: "Building"))
+            let elevation = displayText(entry.elevation, fallback: "Unknown")
+            let key = sectionGroupingKey(building: building, elevation: elevation)
 
             if groupedEntries[key] == nil {
                 orderedKeys.append(key)
@@ -214,12 +325,26 @@ final class PDFSessionReportGenerator {
             groupedEntries[key, default: []].append(entry)
         }
 
-        return orderedKeys.compactMap { key in
-            guard let meta = groupedMeta[key], let entries = groupedEntries[key], entries.isEmpty == false else {
-                return nil
+        for key in retiredNotesBySection.keys where orderedKeys.contains(key) == false {
+            orderedKeys.append(key)
+            if groupedMeta[key] == nil {
+                let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
+                let building = parts.first ?? "Building"
+                let elevation = parts.count > 1 ? parts[1] : "Unknown"
+                groupedMeta[key] = (building: building, elevation: elevation)
             }
+        }
+
+        return orderedKeys.compactMap { key in
+            guard let meta = groupedMeta[key] else { return nil }
+            let entries = groupedEntries[key] ?? []
             let title = "\(meta.building) \(meta.elevation) Elevation"
-            return GroupedPhotoSection(key: key, title: title, entries: entries)
+            return GroupedPhotoSection(
+                key: key,
+                title: title,
+                entries: entries,
+                retiredNotes: retiredNotesBySection[key] ?? []
+            )
         }
     }
 
@@ -245,6 +370,7 @@ final class PDFSessionReportGenerator {
                     key: section.key,
                     title: section.title,
                     entries: section.entries,
+                    retiredNotes: section.retiredNotes,
                     pageChunks: chunks,
                     startPage: startPage,
                     endPage: endPage
@@ -282,8 +408,22 @@ final class PDFSessionReportGenerator {
         }
 
         for line in lines {
-            let lineHeight: CGFloat = line.kind == .sectionHeader ? 18 : 15
-            let lineSpacing: CGFloat = line.kind == .sectionHeader ? 8 : 3
+            let lineHeight: CGFloat
+            let lineSpacing: CGFloat
+            switch line.kind {
+            case .sectionHeader:
+                lineHeight = 18
+                lineSpacing = 8
+            case .photoItem:
+                lineHeight = 15
+                lineSpacing = 3
+            case .retiredSpacer:
+                lineHeight = 6
+                lineSpacing = 6
+            case .retiredNote:
+                lineHeight = 15
+                lineSpacing = 2
+            }
 
             if cursorY - lineHeight < bottomY {
                 commitPageIfNeeded()
@@ -303,21 +443,44 @@ final class PDFSessionReportGenerator {
     private func makeDocumentationIndexLines(for sectionPlans: [PhotoSectionRenderPlan]) -> [DocumentationIndexLine] {
         var lines: [DocumentationIndexLine] = []
         for section in sectionPlans {
+            let headerText: String
+            if section.entries.isEmpty {
+                headerText = section.title
+            } else {
+                headerText = "\(section.title) pages \(section.startPage)-\(section.endPage)"
+            }
             lines.append(DocumentationIndexLine(
                 kind: .sectionHeader,
-                text: "\(section.title) pages \(section.startPage)-\(section.endPage)",
+                text: headerText,
                 pageNumber: nil,
                 isFlagged: false
             ))
             for (index, entry) in section.entries.enumerated() {
                 let photoPageNumber = section.startPage + (index / 2)
-                let caption = captionIdentityLine(for: entry.shot)
+                let caption = captionIdentityLine(for: entry)
                 lines.append(DocumentationIndexLine(
                     kind: .photoItem,
                     text: caption,
                     pageNumber: photoPageNumber,
-                    isFlagged: entry.shot.isFlagged == 1
+                    isFlagged: entry.isFlagged
                 ))
+            }
+
+            if section.retiredNotes.isEmpty == false {
+                lines.append(DocumentationIndexLine(
+                    kind: .retiredSpacer,
+                    text: "",
+                    pageNumber: nil,
+                    isFlagged: false
+                ))
+                for retiredNote in section.retiredNotes {
+                    lines.append(DocumentationIndexLine(
+                        kind: .retiredNote,
+                        text: retiredNote,
+                        pageNumber: nil,
+                        isFlagged: false
+                    ))
+                }
             }
         }
         return lines
@@ -369,7 +532,7 @@ final class PDFSessionReportGenerator {
                 pdfContext.draw(coverImage, in: fitted)
                 pdfContext.restoreGState()
             } else {
-                NSColor(white: 0.94, alpha: 1).setFill()
+                NSColor.white.setFill()
                 imageRect.fill()
             }
 
@@ -570,7 +733,7 @@ final class PDFSessionReportGenerator {
                             )
                         }
 
-                        if let pageNumber = placed.line.pageNumber {
+                        if placed.line.pageNumber != nil {
                             let leaderY = textRect.midY
                             pdfContext.saveGState()
                             pdfContext.setStrokeColor(NSColor.black.withAlphaComponent(0.35).cgColor)
@@ -591,6 +754,16 @@ final class PDFSessionReportGenerator {
                                 alignment: .right
                             )
                         }
+                    case .retiredSpacer:
+                        break
+                    case .retiredNote:
+                        drawText(
+                            placed.line.text,
+                            in: placed.rect,
+                            font: .systemFont(ofSize: 9, weight: .semibold),
+                            color: .black,
+                            alignment: .left
+                        )
                     }
                 }
             }
@@ -660,33 +833,45 @@ final class PDFSessionReportGenerator {
                     height: slotHeight - metadataHeight - photoCaptionGap
                 )
 
-                if let imageURL = entry.imageURL, let image = loadOptimizedCGImage(at: imageURL) {
-                    let fittedRect = aspectFitRect(for: image, in: photoAvailableRect)
-                    pdfContext.saveGState()
-                    let clipPath = NSBezierPath(roundedRect: fittedRect, xRadius: 12, yRadius: 12)
-                    clipPath.addClip()
-                    pdfContext.draw(image, in: fittedRect)
-                    pdfContext.restoreGState()
-                    if entry.shot.isFlagged == 1 {
-                        drawFlaggedBorder(around: fittedRect, in: pdfContext)
-                    }
-                } else {
-                    if let imageURL = entry.imageURL {
-                        log("Session report warning: could not decode image \(imageURL.lastPathComponent)")
-                    }
-                    NSColor(white: 0.95, alpha: 1).setFill()
-                    photoAvailableRect.fill()
-                    drawText(
-                        "Image unavailable",
-                        in: photoAvailableRect,
-                        font: .systemFont(ofSize: 14, weight: .medium),
-                        color: .black,
-                        alignment: .center,
-                        verticalCenter: true
+                if entry.isSkipped {
+                    let placeholderRect = aspectFitRect(
+                        for: CGSize(width: 4, height: 3),
+                        in: photoAvailableRect
                     )
+                    drawSkippedPlaceholder(
+                        reason: entry.skipReason ?? "Skipped",
+                        in: placeholderRect,
+                        context: pdfContext
+                    )
+                } else {
+                    if let imageURL = entry.imageURL, let image = loadOptimizedCGImage(at: imageURL) {
+                        let fittedRect = aspectFitRect(for: image, in: photoAvailableRect)
+                        pdfContext.saveGState()
+                        let clipPath = NSBezierPath(roundedRect: fittedRect, xRadius: 12, yRadius: 12)
+                        clipPath.addClip()
+                        pdfContext.draw(image, in: fittedRect)
+                        pdfContext.restoreGState()
+                        if entry.isFlagged {
+                            drawFlaggedBorder(around: fittedRect, in: pdfContext)
+                        }
+                    } else {
+                        if let imageURL = entry.imageURL {
+                            log("Session report warning: could not decode image \(imageURL.lastPathComponent)")
+                        }
+                        NSColor(white: 0.95, alpha: 1).setFill()
+                        photoAvailableRect.fill()
+                        drawText(
+                            "Image unavailable",
+                            in: photoAvailableRect,
+                            font: .systemFont(ofSize: 14, weight: .medium),
+                            color: .black,
+                            alignment: .center,
+                            verticalCenter: true
+                        )
+                    }
                 }
 
-                drawMetadataBlock(for: entry.shot, in: captionRect)
+                drawMetadataBlock(for: entry, in: captionRect)
             }
 
             drawAddressFooter(
@@ -732,15 +917,92 @@ final class PDFSessionReportGenerator {
         )
     }
 
-    private func drawMetadataBlock(for shot: SessionReportShot, in rect: CGRect) {
+    private func drawSkippedPlaceholder(reason: String, in rect: CGRect, context: CGContext) {
+        context.saveGState()
+        context.setFillColor(NSColor.white.cgColor)
+        let fillPath = CGPath(roundedRect: rect, cornerWidth: 12, cornerHeight: 12, transform: nil)
+        context.addPath(fillPath)
+        context.fillPath()
+        context.restoreGState()
+
+        context.saveGState()
+        context.setStrokeColor(NSColor.black.cgColor)
+        context.setLineWidth(3)
+        let path = CGPath(roundedRect: rect, cornerWidth: 12, cornerHeight: 12, transform: nil)
+        context.addPath(path)
+        context.strokePath()
+        context.restoreGState()
+
+        drawCenteredPlaceholderReason(reason, in: rect.insetBy(dx: 16, dy: 16))
+    }
+
+    private func drawCenteredPlaceholderReason(_ reason: String, in rect: CGRect) {
+        let text = formatSkipReasonDisplay(reason)
+        let stackedText = text
+            .split(separator: " ")
+            .map(String.init)
+            .joined(separator: "\n")
+        let font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byWordWrapping
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.black,
+            .paragraphStyle: paragraph,
+        ]
+        let measured = (stackedText as NSString).boundingRect(
+            with: CGSize(width: rect.width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: attributes
+        )
+        let drawRect = CGRect(
+            x: rect.minX,
+            y: rect.midY - (ceil(measured.height) / 2),
+            width: rect.width,
+            height: ceil(measured.height)
+        )
+        (stackedText as NSString).draw(in: drawRect, withAttributes: attributes)
+    }
+
+    private func formatSkipReasonDisplay(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let withBasicSeparators = trimmed
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+
+        // Break camelCase / PascalCase / alpha-numeric boundaries into separate words.
+        let withWordBoundaries = withBasicSeparators
+            .replacingOccurrences(
+                of: "(?<=[a-z])(?=[A-Z])",
+                with: " ",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: "(?<=[A-Za-z])(?=\\d)",
+                with: " ",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: "(?<=\\d)(?=[A-Za-z])",
+                with: " ",
+                options: .regularExpression
+            )
+
+        let compact = withWordBoundaries
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { $0.isEmpty == false }
+            .joined(separator: " ")
+        return compact.uppercased()
+    }
+
+    private func drawMetadataBlock(for entry: SessionReportPhotoEntry, in rect: CGRect) {
         let titleFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
         let bodyFont = NSFont.systemFont(ofSize: 10, weight: .regular)
         let lineHeight: CGFloat = 14
         let topY = rect.maxY - lineHeight
 
-        let identityLine = captionIdentityLine(for: shot)
-
-        let capturedAt = formattedUTC(shot.capturedAtUTC) ?? "Unknown"
+        let identityLine = captionIdentityLine(for: entry)
         let secondLineY = topY - lineHeight
         let thirdLineY = topY - (lineHeight * 2)
 
@@ -751,8 +1013,10 @@ final class PDFSessionReportGenerator {
             alignment: .center
         )
 
-        if shot.isFlagged == 1 {
-            let flaggedReason = shot.flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let capturedAt = entry.isSkipped ? " " : (formattedUTC(entry.capturedAtUTC) ?? "Unknown")
+
+        if entry.isFlagged {
+            let flaggedReason = entry.flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines)
             let noteText = (flaggedReason?.isEmpty == false) ? flaggedReason! : "Flagged"
             drawFlaggedNote(
                 text: noteText,
@@ -779,14 +1043,137 @@ final class PDFSessionReportGenerator {
     }
 
     private func captionIdentityLine(for shot: SessionReportShot) -> String {
-        [
-            friendlyBuildingLabel(displayText(shot.building, fallback: "B1")),
-            displayText(shot.elevation, fallback: "North"),
-            displayText(shot.detailType, fallback: "General Elevation"),
-            friendlyAngleLabel(detailIdentifier(for: shot)),
+        captionIdentityLine(
+            building: shot.building,
+            elevation: shot.elevation,
+            detailType: shot.detailType,
+            shotKey: shot.shotKey,
+            angleIndex: shot.angleIndex
+        )
+    }
+
+    private func captionIdentityLine(for guidedRow: SessionReportGuidedRow) -> String {
+        captionIdentityLine(
+            building: guidedRow.building,
+            elevation: guidedRow.elevation,
+            detailType: guidedRow.detailType,
+            shotKey: nil,
+            angleIndex: guidedRow.angleIndex
+        )
+    }
+
+    private func captionIdentityLine(for entry: SessionReportPhotoEntry) -> String {
+        captionIdentityLine(
+            building: entry.building,
+            elevation: entry.elevation,
+            detailType: entry.detailType,
+            shotKey: entry.shotKey,
+            angleIndex: entry.angleIndex
+        )
+    }
+
+    private func captionIdentityLine(
+        building: String?,
+        elevation: String?,
+        detailType: String?,
+        shotKey: String?,
+        angleIndex: Int?
+    ) -> String {
+        let angleIdentifier = detailIdentifier(shotKey: shotKey, angleIndex: angleIndex)
+        return [
+            friendlyBuildingLabel(displayText(building, fallback: "B1")),
+            displayText(elevation, fallback: "North"),
+            displayText(detailType, fallback: "General Elevation"),
+            friendlyAngleLabel(angleIdentifier),
         ]
         .joined(separator: " | ")
         .uppercased()
+    }
+
+    private func sectionGroupingKey(building: String?, elevation: String?) -> String {
+        let normalizedBuilding = friendlyBuildingLabel(displayText(building, fallback: "Building")).uppercased()
+        let normalizedElevation = displayText(elevation, fallback: "Unknown").uppercased()
+        return "\(normalizedBuilding)|\(normalizedElevation)"
+    }
+
+    private func slotKey(
+        building: String?,
+        elevation: String?,
+        detailType: String?,
+        shotKey: String?,
+        angleIndex: Int?
+    ) -> String {
+        [
+            displayText(building, fallback: "B1").uppercased(),
+            displayText(elevation, fallback: "North").uppercased(),
+            displayText(detailType, fallback: "General Elevation").uppercased(),
+            detailIdentifier(shotKey: shotKey, angleIndex: angleIndex).uppercased(),
+        ].joined(separator: "|")
+    }
+
+    private func comparePhotoEntries(_ lhs: SessionReportPhotoEntry, _ rhs: SessionReportPhotoEntry) -> Bool {
+        let lhsBuilding = buildingSortKey(lhs.building)
+        let rhsBuilding = buildingSortKey(rhs.building)
+        if lhsBuilding.sortText != rhsBuilding.sortText {
+            return lhsBuilding.sortText < rhsBuilding.sortText
+        }
+        if lhsBuilding.number != rhsBuilding.number {
+            return lhsBuilding.number < rhsBuilding.number
+        }
+
+        let lhsElevation = displayText(lhs.elevation, fallback: "Unknown").uppercased()
+        let rhsElevation = displayText(rhs.elevation, fallback: "Unknown").uppercased()
+        if lhsElevation != rhsElevation {
+            return lhsElevation < rhsElevation
+        }
+
+        let lhsDetail = displayText(lhs.detailType, fallback: "General Elevation").uppercased()
+        let rhsDetail = displayText(rhs.detailType, fallback: "General Elevation").uppercased()
+        if lhsDetail != rhsDetail {
+            return lhsDetail < rhsDetail
+        }
+
+        let lhsAngle = resolvedAngleIndex(for: lhs)
+        let rhsAngle = resolvedAngleIndex(for: rhs)
+        if lhsAngle != rhsAngle {
+            return lhsAngle < rhsAngle
+        }
+
+        if lhs.isSkipped != rhs.isSkipped {
+            return lhs.isSkipped == false
+        }
+
+        let lhsCaptured = parseCapturedDate(lhs.capturedAtUTC)
+        let rhsCaptured = parseCapturedDate(rhs.capturedAtUTC)
+        if lhsCaptured != rhsCaptured {
+            return lhsCaptured < rhsCaptured
+        }
+
+        return lhs.originalFilename.localizedCaseInsensitiveCompare(rhs.originalFilename) == .orderedAscending
+    }
+
+    private func resolvedAngleIndex(for entry: SessionReportPhotoEntry) -> Int {
+        if let angleIndex = entry.angleIndex {
+            return angleIndex
+        }
+        let detail = detailIdentifier(shotKey: entry.shotKey, angleIndex: nil)
+        if let number = numericSuffix(forPrefix: "A", in: detail), let intValue = Int(number) {
+            return intValue
+        }
+        return 0
+    }
+
+    private func buildingSortKey(_ value: String?) -> (sortText: String, number: Int) {
+        let normalized = displayText(value, fallback: "B0").uppercased()
+        if let number = numericSuffix(forPrefix: "B", in: normalized), let intValue = Int(number) {
+            return ("B", intValue)
+        }
+        return (normalized, 0)
+    }
+
+    private func parseCapturedDate(_ raw: String?) -> Date {
+        guard let raw else { return .distantFuture }
+        return Self.parseUTCDate(raw) ?? .distantFuture
     }
 
     private func drawFlaggedBorder(around rect: CGRect, in context: CGContext) {
@@ -860,11 +1247,15 @@ final class PDFSessionReportGenerator {
     }
 
     private func detailIdentifier(for shot: SessionReportShot) -> String {
-        let trimmedShotKey = shot.shotKey?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        detailIdentifier(shotKey: shot.shotKey, angleIndex: shot.angleIndex)
+    }
+
+    private func detailIdentifier(shotKey: String?, angleIndex: Int?) -> String {
+        let trimmedShotKey = shotKey?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         if let trimmedShotKey, trimmedShotKey.range(of: #"^A\d+$"#, options: .regularExpression) != nil {
             return trimmedShotKey
         }
-        return "A\(shot.angleIndex ?? 0)"
+        return "A\(angleIndex ?? 0)"
     }
 
     private func friendlyBuildingLabel(_ value: String) -> String {
@@ -998,6 +1389,10 @@ final class PDFSessionReportGenerator {
 
     private func aspectFitRect(for image: CGImage, in container: CGRect) -> CGRect {
         let imageSize = CGSize(width: image.width, height: image.height)
+        return aspectFitRect(for: imageSize, in: container)
+    }
+
+    private func aspectFitRect(for imageSize: CGSize, in container: CGRect) -> CGRect {
         guard imageSize.width > 0, imageSize.height > 0, container.width > 0, container.height > 0 else {
             return container
         }
@@ -1322,17 +1717,44 @@ final class PDFSessionReportGenerator {
     private struct SessionReportContext {
         let session: SessionReportSession
         let shots: [SessionReportShot]
+        let guidedRows: [SessionReportGuidedRow]
     }
 
     private struct SessionReportPhotoEntry {
-        let shot: SessionReportShot
+        let shot: SessionReportShot?
+        let guidedRow: SessionReportGuidedRow?
         let imageURL: URL?
+
+        init(shot: SessionReportShot, imageURL: URL?) {
+            self.shot = shot
+            self.guidedRow = nil
+            self.imageURL = imageURL
+        }
+
+        init(skippedGuidedRow: SessionReportGuidedRow) {
+            self.shot = nil
+            self.guidedRow = skippedGuidedRow
+            self.imageURL = nil
+        }
+
+        var isSkipped: Bool { guidedRow != nil }
+        var skipReason: String? { guidedRow?.skipReason }
+        var isFlagged: Bool { shot?.isFlagged == 1 }
+        var flaggedReason: String? { shot?.flaggedReason }
+        var capturedAtUTC: String? { shot?.capturedAtUTC }
+        var building: String? { shot?.building ?? guidedRow?.building }
+        var elevation: String? { shot?.elevation ?? guidedRow?.elevation }
+        var detailType: String? { shot?.detailType ?? guidedRow?.detailType }
+        var angleIndex: Int? { shot?.angleIndex ?? guidedRow?.angleIndex }
+        var shotKey: String? { shot?.shotKey }
+        var originalFilename: String { shot?.originalFilename ?? "" }
     }
 
     private struct GroupedPhotoSection {
         let key: String
         let title: String
         let entries: [SessionReportPhotoEntry]
+        let retiredNotes: [String]
     }
 
     private struct PhotoChunkPlan {
@@ -1344,6 +1766,7 @@ final class PDFSessionReportGenerator {
         let key: String
         let title: String
         let entries: [SessionReportPhotoEntry]
+        let retiredNotes: [String]
         let pageChunks: [PhotoChunkPlan]
         let startPage: Int
         let endPage: Int
@@ -1353,6 +1776,8 @@ final class PDFSessionReportGenerator {
         enum Kind {
             case sectionHeader
             case photoItem
+            case retiredSpacer
+            case retiredNote
         }
 
         let kind: Kind
@@ -1369,6 +1794,11 @@ final class PDFSessionReportGenerator {
     private struct DocumentationIndexPagePlan {
         let pageIndex: Int
         let lines: [DocumentationIndexPlacedLine]
+    }
+
+    private struct PreparedPhotoEntries {
+        let entries: [SessionReportPhotoEntry]
+        let retiredNotesBySection: [String: [String]]
     }
 
     private struct ImageCatalog {
@@ -1612,7 +2042,7 @@ final class PDFSessionReportGenerator {
         return formatter
     }()
 
-    private static func parseUTCDate(_ rawValue: String) -> Date? {
+    fileprivate static func parseUTCDate(_ rawValue: String) -> Date? {
         if let date = iso8601FormatterWithFractionalSeconds.date(from: rawValue) {
             return date
         }
@@ -1679,6 +2109,95 @@ private struct SessionReportShot: FetchableRecord, Decodable {
         case stampedJpegFilename = "stamped_jpeg_filename"
         case isFlagged = "is_flagged"
         case flaggedReason = "flagged_reason"
+    }
+}
+
+private struct SessionReportGuidedRow: FetchableRecord, Decodable {
+    let sessionID: String
+    let building: String?
+    let elevation: String?
+    let detailType: String?
+    let angleIndex: Int?
+    let status: String?
+    let isRetiredRaw: Int?
+    let retiredAtUTC: String?
+    let skipReason: String?
+    let skipSessionID: String?
+
+    var isRetired: Bool {
+        if isRetiredRaw == 1 { return true }
+        let trimmedStatus = status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmedStatus == "retired"
+    }
+
+    func wasRetiredDuringSession(sessionStartedAtUTC: String, sessionEndedAtUTC: String?) -> Bool {
+        guard isRetired else { return false }
+        guard let retiredAtUTC else { return false }
+        guard let sessionStart = PDFSessionReportGenerator.parseUTCDate(sessionStartedAtUTC) else {
+            return false
+        }
+        let retiredDate = SessionReportGuidedRow.parseFlexibleDate(retiredAtUTC)
+            ?? SessionReportGuidedRow.parseUsingSessionDatePrefix(retiredAtUTC)
+
+        guard let retiredDate else { return false }
+
+        if let sessionEndedAtUTC,
+           let sessionEnd = PDFSessionReportGenerator.parseUTCDate(sessionEndedAtUTC) {
+            return retiredDate >= sessionStart && retiredDate <= sessionEnd
+        }
+
+        let fallbackEnd = sessionStart.addingTimeInterval(24 * 60 * 60)
+        return retiredDate >= sessionStart && retiredDate <= fallbackEnd
+    }
+
+    private static func parseFlexibleDate(_ raw: String) -> Date? {
+        if let iso = PDFSessionReportGenerator.parseUTCDate(raw) {
+            return iso
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+
+        let formats = [
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd HH:mm",
+            "MM/dd/yyyy HH:mm:ss",
+            "MM/dd/yyyy HH:mm",
+            "MM/dd/yyyy h:mma",
+            "MM/dd/yyyy h:mm a",
+        ]
+
+        for format in formats {
+            formatter.dateFormat = format
+            if let parsed = formatter.date(from: raw) {
+                return parsed
+            }
+        }
+        return nil
+    }
+
+    private static func parseUsingSessionDatePrefix(_ raw: String) -> Date? {
+        guard raw.count >= 10 else { return nil }
+        let prefix = String(raw.prefix(10))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.date(from: prefix)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case building
+        case elevation
+        case detailType = "detail_type"
+        case angleIndex = "angle_index"
+        case status
+        case isRetiredRaw = "is_retired"
+        case retiredAtUTC = "retired_at"
+        case skipReason = "skip_reason"
+        case skipSessionID = "skip_session_id"
     }
 }
 
