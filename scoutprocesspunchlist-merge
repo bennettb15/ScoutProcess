@@ -1,0 +1,40 @@
+#!/bin/bash
+set -euo pipefail
+
+REPO_PATH="/Users/brian/Desktop/ScoutProcess"
+SOURCE_BRANCH="main"
+TARGET_BRANCH="codex/punchlist-v1"
+MERGE_REASON="${1:-}"
+
+cd "$REPO_PATH" || { echo "ScoutProcess repo not found."; exit 1; }
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Working tree is not clean. Commit, stash, or discard changes first."
+  exit 1
+fi
+
+if ! git show-ref --verify --quiet "refs/heads/$SOURCE_BRANCH"; then
+  echo "Local branch '$SOURCE_BRANCH' not found."
+  exit 1
+fi
+
+if ! git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+  echo "Local branch '$TARGET_BRANCH' not found."
+  exit 1
+fi
+
+git checkout "$TARGET_BRANCH"
+
+if [[ -n "$MERGE_REASON" ]]; then
+  git merge --no-ff -m "$MERGE_REASON" "$SOURCE_BRANCH"
+else
+  git merge "$SOURCE_BRANCH"
+fi
+
+if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+  git push
+else
+  git push --set-upstream origin "$TARGET_BRANCH"
+fi
+
+echo "Merged '$SOURCE_BRANCH' into '$TARGET_BRANCH' and pushed."
