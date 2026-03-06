@@ -11,16 +11,36 @@ import AppKit
 struct ContentView: View {
     @Environment(ScoutProcessModel.self) private var model
     @Environment(\.colorScheme) private var colorScheme
+    @State private var selectedTab: DashboardTab = .pipeline
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             header
-            queueSection
-            logSection
+            tabSelector
+            if selectedTab == .pipeline {
+                queueSection
+                logSection
+            } else {
+                PunchListView()
+            }
             footer
         }
         .padding(20)
         .frame(minWidth: 860, minHeight: 620)
+    }
+
+    private enum DashboardTab: String, CaseIterable, Identifiable {
+        case pipeline
+        case punchList
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .pipeline: return "Pipeline"
+            case .punchList: return "Punch List"
+            }
+        }
     }
 
     private var header: some View {
@@ -95,6 +115,16 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private var tabSelector: some View {
+        Picker("Mode", selection: $selectedTab) {
+            ForEach(DashboardTab.allCases) { tab in
+                Text(tab.label).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(maxWidth: 320)
     }
 
     private var queueSection: some View {

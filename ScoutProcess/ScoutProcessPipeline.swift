@@ -514,6 +514,17 @@ final class ScoutProcessController {
             }
 
             log("Stamp summary: requested=\(manifest.shots.count) generated=\(processedCount) failed=\(stampingErrors.count)")
+            if let sessionID = importResult.sessionID,
+               let dbQueue = DatabaseManager.shared.dbQueue {
+                do {
+                    let syncedCount = try dbQueue.write { db in
+                        try PunchListService.shared.syncFlaggedItems(forSessionID: sessionID, db: db)
+                    }
+                    log("Punch list sync complete for session \(sessionID): \(syncedCount) item(s)")
+                } catch {
+                    log("Punch list sync failed for session \(sessionID): \(error.localizedDescription)")
+                }
+            }
 
             lastStep = "routing archived session"
             let archivedSessionURL = try archiveSessionFolder(

@@ -420,6 +420,101 @@ final class DatabaseManager {
             }
         }
 
+        migrator.registerMigration("addPunchListTablesV1") { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS punch_list_items (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    shot_id TEXT,
+                    issue_id TEXT,
+                    logical_shot_identity TEXT NOT NULL,
+                    property_id TEXT,
+                    property_name TEXT,
+                    org_name TEXT,
+                    building TEXT,
+                    elevation TEXT,
+                    detail_type TEXT,
+                    angle_index INTEGER,
+                    shot_key TEXT,
+                    captured_at_utc TEXT,
+                    flagged_reason TEXT,
+                    stamped_jpeg_filename TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    priority TEXT NOT NULL DEFAULT 'medium',
+                    assigned_to TEXT,
+                    due_date TEXT,
+                    resolution_note TEXT,
+                    resolved_at_utc TEXT,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL
+                )
+                """)
+
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_punch_list_items_session_identity
+                ON punch_list_items (session_id, logical_shot_identity)
+                """)
+
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_punch_list_items_status
+                ON punch_list_items (status)
+                """)
+
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_punch_list_items_property
+                ON punch_list_items (property_id, property_name)
+                """)
+
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS punch_list_evidence (
+                    id INTEGER PRIMARY KEY,
+                    punch_list_item_id INTEGER NOT NULL REFERENCES punch_list_items(id) ON DELETE CASCADE,
+                    file_path TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    captured_at_utc TEXT,
+                    uploaded_at_utc TEXT NOT NULL,
+                    uploader TEXT,
+                    file_hash TEXT
+                )
+                """)
+
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_punch_list_evidence_item
+                ON punch_list_evidence (punch_list_item_id)
+                """)
+
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS punch_list_history (
+                    id INTEGER PRIMARY KEY,
+                    punch_list_item_id INTEGER NOT NULL REFERENCES punch_list_items(id) ON DELETE CASCADE,
+                    action TEXT NOT NULL,
+                    from_value TEXT,
+                    to_value TEXT,
+                    actor TEXT,
+                    created_at_utc TEXT NOT NULL
+                )
+                """)
+
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_punch_list_history_item_time
+                ON punch_list_history (punch_list_item_id, created_at_utc)
+                """)
+        }
+
+        migrator.registerMigration("addPunchListPriorityV1") { db in
+            let columnNames = try Set(db.columns(in: "punch_list_items").map(\.name))
+            if columnNames.contains("priority") == false {
+                try db.execute(sql: "ALTER TABLE punch_list_items ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'")
+            }
+        }
+
+        migrator.registerMigration("addPunchListTradeV1") { db in
+            let columnNames = try Set(db.columns(in: "punch_list_items").map(\.name))
+            if columnNames.contains("trade") == false {
+                try db.execute(sql: "ALTER TABLE punch_list_items ADD COLUMN trade TEXT NOT NULL DEFAULT 'general'")
+            }
+        }
+
         do {
             try migrator.migrate(dbQueue)
         } catch {

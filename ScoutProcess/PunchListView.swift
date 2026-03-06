@@ -711,7 +711,11 @@ struct PunchListView: View {
                 guard let filename = shot.stampedJpegFilename,
                       let imageURL = PunchListService.shared.resolveArchivedImageURL(
                         filename: filename,
-                        preferredSessionID: shot.sessionID
+                        preferredSessionID: shot.sessionID,
+                        preferredPropertyID: shot.propertyID,
+                        preferredLogicalShotIdentity: shot.logicalShotIdentity,
+                        preferredShotKey: shot.shotKey,
+                        preferredCapturedAtUTC: shot.capturedAtUTC
                       ),
                       let image = NSImage(contentsOf: imageURL) else {
                     continue
@@ -2095,7 +2099,11 @@ struct PunchListView: View {
               filename.isEmpty == false,
               let imageURL = PunchListService.shared.resolveArchivedImageURL(
                 filename: filename,
-                preferredSessionID: item.sessionID
+                preferredSessionID: item.sessionID,
+                preferredPropertyID: item.propertyID,
+                preferredLogicalShotIdentity: item.logicalShotIdentity,
+                preferredShotKey: item.shotKey,
+                preferredCapturedAtUTC: item.capturedAtUTC
               ),
               let image = NSImage(contentsOf: imageURL) else {
             return nil

@@ -237,3 +237,107 @@ struct GuidedRowRecord: Codable, FetchableRecord, PersistableRecord {
         case skipSessionID = "skip_session_id"
     }
 }
+
+struct PunchListItemRecord: Codable, FetchableRecord, PersistableRecord {
+    var id: Int64?
+    var sessionID: String
+    var shotID: String?
+    var issueID: String?
+    var logicalShotIdentity: String
+    var propertyID: String?
+    var propertyName: String?
+    var orgName: String?
+    var building: String?
+    var elevation: String?
+    var detailType: String?
+    var angleIndex: Int?
+    var shotKey: String?
+    var capturedAtUTC: String?
+    var flaggedReason: String?
+    var stampedJpegFilename: String?
+    var status: String
+    var priority: String
+    var trade: String
+    var assignedTo: String?
+    var dueDate: String?
+    var resolutionNote: String?
+    var resolvedAtUTC: String?
+    var createdAtUTC: String
+    var updatedAtUTC: String
+
+    static let databaseTableName = "punch_list_items"
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionID = "session_id"
+        case shotID = "shot_id"
+        case issueID = "issue_id"
+        case logicalShotIdentity = "logical_shot_identity"
+        case propertyID = "property_id"
+        case propertyName = "property_name"
+        case orgName = "org_name"
+        case building
+        case elevation
+        case detailType = "detail_type"
+        case angleIndex = "angle_index"
+        case shotKey = "shot_key"
+        case capturedAtUTC = "captured_at_utc"
+        case flaggedReason = "flagged_reason"
+        case stampedJpegFilename = "stamped_jpeg_filename"
+        case status
+        case priority
+        case trade
+        case assignedTo = "assigned_to"
+        case dueDate = "due_date"
+        case resolutionNote = "resolution_note"
+        case resolvedAtUTC = "resolved_at_utc"
+        case createdAtUTC = "created_at_utc"
+        case updatedAtUTC = "updated_at_utc"
+    }
+}
+
+struct PunchListEvidenceRecord: Codable, FetchableRecord, PersistableRecord {
+    var id: Int64?
+    var punchListItemID: Int64
+    var filePath: String
+    var sourceType: String
+    var capturedAtUTC: String?
+    var uploadedAtUTC: String
+    var uploader: String?
+    var fileHash: String?
+
+    static let databaseTableName = "punch_list_evidence"
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case punchListItemID = "punch_list_item_id"
+        case filePath = "file_path"
+        case sourceType = "source_type"
+        case capturedAtUTC = "captured_at_utc"
+        case uploadedAtUTC = "uploaded_at_utc"
+        case uploader
+        case fileHash = "file_hash"
+    }
+}
+
+struct PunchListHistoryRecord: Codable, FetchableRecord, PersistableRecord {
+    var id: Int64?
+    var punchListItemID: Int64
+    var action: String
+    var fromValue: String?
+    var toValue: String?
+    var actor: String?
+    var createdAtUTC: String
+
+    static let databaseTableName = "punch_list_history"
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case punchListItemID = "punch_list_item_id"
+        case action
+        case fromValue = "from_value"
+        case toValue = "to_value"
+        case actor
+        case createdAtUTC = "created_at_utc"
+    }
+}

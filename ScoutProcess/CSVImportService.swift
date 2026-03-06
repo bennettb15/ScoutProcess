@@ -233,6 +233,8 @@ final class CSVImportService {
         var rowCounts = ImportRowCounts.zero
 
         try db.inSavepoint {
+            try clearSessionScopedRowsForReimport(db: db, sessionID: sessionID)
+
             rowCounts.rowsSessions = try upsertSessions(
                 db: db,
                 file: sessionsFile,
@@ -287,6 +289,48 @@ final class CSVImportService {
                 issueHistorySkippedMalformedRows: rowCounts.issueHistorySkippedMalformedRows,
                 issueHistorySkippedOrphanRows: rowCounts.issueHistorySkippedOrphanRows
             )
+        )
+    }
+
+    private func clearSessionScopedRowsForReimport(db: Database, sessionID: String) throws {
+        // Replace existing session payload instead of leaving stale rows behind on re-import.
+        try db.execute(
+            sql: """
+            WITH session_issue_ids AS (
+                SELECT DISTINCT issue_id
+                FROM shots
+                WHERE session_id = ?
+                  AND issue_id IS NOT NULL
+                  AND TRIM(issue_id) <> ''
+            )
+            DELETE FROM issues
+            WHERE issue_id IN (SELECT issue_id FROM session_issue_ids)
+              AND issue_id NOT IN (
+                  SELECT DISTINCT issue_id
+                  FROM shots
+                  WHERE issue_id IS NOT NULL
+                    AND TRIM(issue_id) <> ''
+                    AND session_id <> ?
+              )
+            """,
+            arguments: [sessionID, sessionID]
+        )
+
+        try db.execute(
+            sql: "DELETE FROM issue_history WHERE session_id = ?",
+            arguments: [sessionID]
+        )
+        try db.execute(
+            sql: "DELETE FROM guided_rows WHERE session_id = ?",
+            arguments: [sessionID]
+        )
+        try db.execute(
+            sql: "DELETE FROM shots WHERE session_id = ?",
+            arguments: [sessionID]
+        )
+        try db.execute(
+            sql: "DELETE FROM punch_list_items WHERE session_id = ?",
+            arguments: [sessionID]
         )
     }
 
