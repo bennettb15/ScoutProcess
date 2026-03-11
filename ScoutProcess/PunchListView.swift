@@ -1113,8 +1113,13 @@ struct PunchListView: View {
         return org.isEmpty ? nil : org
     }
 
+    private func normalizedPriority(_ rawPriority: String) -> PunchListPriority? {
+        let normalized = rawPriority.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return PunchListPriority(rawValue: normalized)
+    }
+
     private func displayPriority(_ rawPriority: String) -> String {
-        PunchListPriority(rawValue: rawPriority)?.label ?? rawPriority.capitalized
+        normalizedPriority(rawPriority)?.label ?? rawPriority.capitalized
     }
 
     private func displayTrade(_ rawTrade: String) -> String {
@@ -1449,12 +1454,19 @@ struct PunchListView: View {
     }
 
     private func priorityColor(_ rawPriority: String) -> Color {
-        switch PunchListPriority(rawValue: rawPriority) {
-        case .low: return .secondary
-        case .medium: return Color(red: 0.24, green: 0.28, blue: 0.34)
+        switch normalizedPriority(rawPriority) {
+        case .low: return .blue
+        case .medium: return .yellow
         case .high: return .orange
         case .critical: return .red
         case .none: return .secondary
+        }
+    }
+
+    private func priorityTextColor(_ rawPriority: String) -> Color {
+        switch normalizedPriority(rawPriority) {
+        case .medium: return .black
+        default: return .white
         }
     }
 
@@ -1470,7 +1482,7 @@ struct PunchListView: View {
                 Image(systemName: "chevron.down")
                     .font(.system(size: 9, weight: .semibold))
             }
-            .foregroundStyle(.white)
+            .foregroundStyle(priorityTextColor(item.priority))
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .frame(width: rowMediaControlSize, alignment: .center)
@@ -1500,7 +1512,7 @@ struct PunchListView: View {
                                 .frame(width: 8, height: 8)
                             Text(priority.label)
                             Spacer()
-                            if item.priority == priority.rawValue {
+                            if normalizedPriority(item.priority) == priority {
                                 Image(systemName: "checkmark")
                                     .font(.caption.weight(.semibold))
                             }
@@ -1987,7 +1999,7 @@ struct PunchListView: View {
             } else if isResolved {
                 return false
             }
-            if let selectedPriority, item.priority != selectedPriority.rawValue {
+            if let selectedPriority, normalizedPriority(item.priority) != selectedPriority {
                 return false
             }
             if let selectedTradeFilter, item.trade != selectedTradeFilter.rawValue {
@@ -2118,9 +2130,7 @@ struct PunchListView: View {
         loadingThumbnailItemIDs.insert(item.id)
         defer { loadingThumbnailItemIDs.remove(item.id) }
 
-        let image = await Task.detached(priority: .utility) {
-            Self.loadRowThumbnail(for: item)
-        }.value
+        let image = Self.loadRowThumbnail(for: item)
 
         if let image {
             rowThumbnailImages[item.id] = image

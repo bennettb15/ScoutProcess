@@ -121,7 +121,9 @@ final class DatabaseManager {
                     longitude REAL,
                     lens TEXT,
                     original_filename TEXT NOT NULL,
-                    original_byte_size INTEGER
+                    original_byte_size INTEGER,
+                    trade TEXT,
+                    priority TEXT
                 )
                 """)
 
@@ -226,7 +228,9 @@ final class DatabaseManager {
                     is_retired INTEGER NOT NULL DEFAULT 0,
                     retired_at TEXT,
                     skip_reason TEXT,
-                    skip_session_id TEXT
+                    skip_session_id TEXT,
+                    trade TEXT,
+                    priority TEXT
                 )
                 """)
 
@@ -417,6 +421,24 @@ final class DatabaseManager {
             }
             if shotColumnNames.contains("propertyZip") == false {
                 try db.execute(sql: "ALTER TABLE shots ADD COLUMN propertyZip TEXT")
+            }
+        }
+
+        migrator.registerMigration("addTradePriorityToCaptureTablesV1") { db in
+            let shotColumnNames = try Set(db.columns(in: "shots").map(\.name))
+            if shotColumnNames.contains("trade") == false {
+                try db.execute(sql: "ALTER TABLE shots ADD COLUMN trade TEXT")
+            }
+            if shotColumnNames.contains("priority") == false {
+                try db.execute(sql: "ALTER TABLE shots ADD COLUMN priority TEXT")
+            }
+
+            let guidedRowColumnNames = try Set(db.columns(in: "guided_rows").map(\.name))
+            if guidedRowColumnNames.contains("trade") == false {
+                try db.execute(sql: "ALTER TABLE guided_rows ADD COLUMN trade TEXT")
+            }
+            if guidedRowColumnNames.contains("priority") == false {
+                try db.execute(sql: "ALTER TABLE guided_rows ADD COLUMN priority TEXT")
             }
         }
 

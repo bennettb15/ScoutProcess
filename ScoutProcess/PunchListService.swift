@@ -206,6 +206,8 @@ final class PunchListService {
                     s.captured_at_utc,
                     COALESCE(NULLIF(TRIM(s.flagged_reason), ''), NULLIF(TRIM(i.current_reason), '')) AS flagged_reason,
                     s.stamped_jpeg_filename,
+                    NULLIF(TRIM(s.priority), '') AS source_priority,
+                    NULLIF(TRIM(s.trade), '') AS source_trade,
                     CASE
                         WHEN i.resolved_at_utc IS NOT NULL AND TRIM(i.resolved_at_utc) <> '' THEN 'resolved'
                         WHEN LOWER(TRIM(COALESCE(i.current_status, ''))) = 'resolved' THEN 'resolved'
@@ -286,8 +288,8 @@ final class PunchListService {
                     WHEN seeded.derived_status = 'resolved' THEN 'resolved'
                     ELSE COALESCE(NULLIF(TRIM(prior.status), ''), seeded.derived_status, 'active')
                 END,
-                COALESCE(NULLIF(TRIM(prior.priority), ''), 'medium'),
-                COALESCE(NULLIF(TRIM(prior.trade), ''), 'general'),
+                COALESCE(seeded.source_priority, NULLIF(TRIM(prior.priority), ''), 'medium'),
+                COALESCE(seeded.source_trade, NULLIF(TRIM(prior.trade), ''), 'general'),
                 prior.assigned_to,
                 prior.due_date,
                 prior.resolution_note,
@@ -318,8 +320,8 @@ final class PunchListService {
                     WHEN punch_list_items.status = 'resolved' THEN 'resolved'
                     ELSE COALESCE(NULLIF(TRIM(punch_list_items.status), ''), excluded.status, 'active')
                 END,
-                priority = COALESCE(NULLIF(TRIM(punch_list_items.priority), ''), excluded.priority, 'medium'),
-                trade = COALESCE(NULLIF(TRIM(punch_list_items.trade), ''), excluded.trade, 'general'),
+                priority = COALESCE(NULLIF(TRIM(excluded.priority), ''), NULLIF(TRIM(punch_list_items.priority), ''), 'medium'),
+                trade = COALESCE(NULLIF(TRIM(excluded.trade), ''), NULLIF(TRIM(punch_list_items.trade), ''), 'general'),
                 assigned_to = COALESCE(NULLIF(TRIM(punch_list_items.assigned_to), ''), excluded.assigned_to),
                 due_date = COALESCE(NULLIF(TRIM(punch_list_items.due_date), ''), excluded.due_date),
                 resolution_note = COALESCE(NULLIF(TRIM(punch_list_items.resolution_note), ''), excluded.resolution_note),
@@ -339,8 +341,7 @@ final class PunchListService {
                 status = 'resolved',
                 resolved_at_utc = COALESCE(resolved_at_utc, ?),
                 updated_at_utc = ?
-            WHERE session_id = ?
-              AND issue_id IN (
+            WHERE issue_id IN (
                   SELECT issue_id
                   FROM issues
                   WHERE issue_id IS NOT NULL
@@ -349,6 +350,33 @@ final class PunchListService {
                         OR LOWER(TRIM(COALESCE(current_status, ''))) = 'resolved'
                     )
               )
+            """,
+            arguments: [nowUTC, nowUTC]
+        )
+
+        try db.execute(
+            sql: """
+            UPDATE punch_list_items
+            SET
+                status = 'resolved',
+                resolved_at_utc = COALESCE(resolved_at_utc, ?),
+                updated_at_utc = ?
+            WHERE (COALESCE(property_id, ''), LOWER(TRIM(COALESCE(building, ''))), LOWER(TRIM(COALESCE(elevation, ''))), LOWER(TRIM(COALESCE(detail_type, ''))), COALESCE(angle_index, -1))
+                  IN (
+                      SELECT
+                          COALESCE(s.property_id, ''),
+                          LOWER(TRIM(COALESCE(s.building, ''))),
+                          LOWER(TRIM(COALESCE(s.elevation, ''))),
+                          LOWER(TRIM(COALESCE(s.detail_type, ''))),
+                          COALESCE(s.angle_index, -1)
+                      FROM shots s
+                      LEFT JOIN issues i ON i.issue_id = s.issue_id
+                      WHERE s.session_id = ?
+                        AND (
+                            (i.resolved_at_utc IS NOT NULL AND TRIM(i.resolved_at_utc) <> '')
+                            OR LOWER(TRIM(COALESCE(i.current_status, ''))) = 'resolved'
+                        )
+                  )
             """,
             arguments: [nowUTC, nowUTC, sessionID]
         )
@@ -490,6 +518,14 @@ final class PunchListService {
                     s.is_flagged,
                     COALESCE(
                         NULLIF(TRIM(s.flagged_reason), ''),
+                        NULLIF(TRIM((
+                            SELECT pli.flagged_reason
+                            FROM punch_list_items pli
+                            WHERE pli.session_id = s.session_id
+                              AND COALESCE(pli.shot_id, '') = COALESCE(s.shot_id, '')
+                            ORDER BY COALESCE(pli.updated_at_utc, '') DESC, pli.id DESC
+                            LIMIT 1
+                        )), ''),
                         NULLIF(TRIM((
                             SELECT pli.flagged_reason
                             FROM punch_list_items pli

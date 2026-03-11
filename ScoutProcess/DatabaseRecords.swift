@@ -84,6 +84,8 @@ struct ShotRecord: Codable, FetchableRecord, PersistableRecord {
     var originalByteSize: Int?
     var stampedJpegFilename: String?
     var flaggedReason: String?
+    var trade: String?
+    var priority: String?
 
     static let databaseTableName = "shots"
 
@@ -113,6 +115,8 @@ struct ShotRecord: Codable, FetchableRecord, PersistableRecord {
         case originalByteSize = "original_byte_size"
         case stampedJpegFilename = "stamped_jpeg_filename"
         case flaggedReason = "flagged_reason"
+        case trade
+        case priority
     }
 }
 
@@ -215,6 +219,8 @@ struct GuidedRowRecord: Codable, FetchableRecord, PersistableRecord {
     var retiredAt: String?
     var skipReason: String?
     var skipSessionID: String?
+    var trade: String?
+    var priority: String?
 
     static let databaseTableName = "guided_rows"
 
@@ -235,6 +241,8 @@ struct GuidedRowRecord: Codable, FetchableRecord, PersistableRecord {
         case retiredAt = "retired_at"
         case skipReason = "skip_reason"
         case skipSessionID = "skip_session_id"
+        case trade
+        case priority
     }
 }
 

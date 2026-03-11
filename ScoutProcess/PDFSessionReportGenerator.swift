@@ -66,6 +66,15 @@ final class PDFSessionReportGenerator {
                     shots.original_filename,
                     shots.stamped_jpeg_filename,
                     shots.is_flagged,
+                    CASE
+                        WHEN (
+                            (issues.resolved_at_utc IS NOT NULL AND TRIM(issues.resolved_at_utc) <> '')
+                            OR LOWER(TRIM(COALESCE(issues.current_status, ''))) = 'resolved'
+                        )
+                        AND COALESCE(NULLIF(TRIM(issues.last_capture_session_id), ''), shots.session_id) = shots.session_id
+                        THEN 1
+                        ELSE 0
+                    END AS is_resolved_in_session,
                     COALESCE(NULLIF(TRIM(shots.flagged_reason), ''), NULLIF(TRIM(issues.current_reason), '')) AS flagged_reason
                 FROM shots
                 LEFT JOIN issues ON issues.issue_id = shots.issue_id
@@ -148,6 +157,15 @@ final class PDFSessionReportGenerator {
                     shots.original_filename,
                     shots.stamped_jpeg_filename,
                     shots.is_flagged,
+                    CASE
+                        WHEN (
+                            (issues.resolved_at_utc IS NOT NULL AND TRIM(issues.resolved_at_utc) <> '')
+                            OR LOWER(TRIM(COALESCE(issues.current_status, ''))) = 'resolved'
+                        )
+                        AND COALESCE(NULLIF(TRIM(issues.last_capture_session_id), ''), shots.session_id) = shots.session_id
+                        THEN 1
+                        ELSE 0
+                    END AS is_resolved_in_session,
                     COALESCE(NULLIF(TRIM(shots.flagged_reason), ''), NULLIF(TRIM(issues.current_reason), '')) AS flagged_reason
                 FROM shots
                 LEFT JOIN issues ON issues.issue_id = shots.issue_id
@@ -182,7 +200,7 @@ final class PDFSessionReportGenerator {
         let comparisonEntries = try dbQueue.read { db in
             var entries: [FlaggedComparisonEntry] = []
             let flaggedShots = reportContext.shots
-                .filter { $0.isFlagged == 1 }
+                .filter { $0.isFlagged == 1 || $0.isResolvedInSession == 1 }
                 .sorted(by: compareShotsForComparison)
             var archivedFolderCache: [String: URL] = [:]
 
@@ -475,12 +493,14 @@ final class PDFSessionReportGenerator {
                     drawComparisonImage(
                         imageURL: entry.currentImageURL,
                         placeholderReason: "IMAGE UNAVAILABLE",
+                        visualState: entry.currentShot.visualState,
                         in: photoAvailableRect,
                         context: pdfContext
                     )
                     drawComparisonMetadata(
                         identityLine: captionIdentityLine(for: entry.currentShot),
                         sessionLine: "Current Session: \(entry.currentDateText)",
+                        visualState: entry.currentShot.visualState,
                         flaggedReason: entry.currentShot.flaggedReason,
                         in: captionRect
                     )
@@ -489,6 +509,7 @@ final class PDFSessionReportGenerator {
                     drawComparisonImage(
                         imageURL: entry.previousImageURL,
                         placeholderReason: placeholderReason,
+                        visualState: entry.previousShot?.visualState ?? .none,
                         in: photoAvailableRect,
                         context: pdfContext
                     )
@@ -501,6 +522,7 @@ final class PDFSessionReportGenerator {
                             angleIndex: entry.currentShot.angleIndex
                         ),
                         sessionLine: "Previous Session: \(entry.previousDateText)",
+                        visualState: entry.previousShot?.visualState ?? .none,
                         flaggedReason: entry.previousShot?.flaggedReason,
                         in: captionRect
                     )
@@ -518,6 +540,7 @@ final class PDFSessionReportGenerator {
     private func drawComparisonImage(
         imageURL: URL?,
         placeholderReason: String,
+        visualState: ReportVisualState,
         in rect: CGRect,
         context: CGContext
     ) {
@@ -528,7 +551,9 @@ final class PDFSessionReportGenerator {
             clipPath.addClip()
             context.draw(image, in: fittedRect)
             context.restoreGState()
-            drawFlaggedBorder(around: fittedRect, in: context)
+            if visualState != .none {
+                drawFlaggedBorder(around: fittedRect, in: context, visualState: visualState)
+            }
         } else {
             let placeholderRect = aspectFitRect(
                 for: CGSize(width: 4, height: 3),
@@ -545,6 +570,7 @@ final class PDFSessionReportGenerator {
     private func drawComparisonMetadata(
         identityLine: String,
         sessionLine: String,
+        visualState: ReportVisualState,
         flaggedReason: String?,
         in rect: CGRect
     ) {
@@ -560,11 +586,13 @@ final class PDFSessionReportGenerator {
             alignment: .center
         )
         let trimmedReason = flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let trimmedReason, trimmedReason.isEmpty == false {
+        if let trimmedReason, trimmedReason.isEmpty == false, visualState != .none {
+            let noteText = visualState == .resolved ? "Resolved - \(trimmedReason)" : trimmedReason
             drawFlaggedNote(
-                text: trimmedReason,
+                text: noteText,
                 in: CGRect(x: rect.minX, y: topY - lineHeight, width: rect.width, height: lineHeight),
                 font: bodyFont,
+                visualState: visualState,
                 alignment: .center
             )
             drawText(
@@ -588,17 +616,19 @@ final class PDFSessionReportGenerator {
         startingPage: Int
     ) -> [DocumentationIndexLine] {
         var lines: [DocumentationIndexLine] = []
-        lines.append(DocumentationIndexLine(kind: .sectionHeader, text: "Flagged Items", pageNumber: nil, isFlagged: false))
+        lines.append(DocumentationIndexLine(kind: .sectionHeader, text: "Flagged Items", pageNumber: nil, isFlagged: false, visualState: .none))
 
         for (index, entry) in comparisonEntries.enumerated() {
             let page = startingPage + index
-            let text = "\(captionIdentityLine(for: entry.currentShot)) | \(entry.currentMonthYear) vs \(entry.previousMonthYear)"
+            let resolvedSuffix = entry.currentShot.visualState == .resolved ? " | Resolved" : ""
+            let text = "\(captionIdentityLine(for: entry.currentShot)) | \(entry.currentMonthYear) vs \(entry.previousMonthYear)\(resolvedSuffix)"
             lines.append(
                 DocumentationIndexLine(
                     kind: .photoItem,
                     text: text,
                     pageNumber: page,
-                    isFlagged: true
+                    isFlagged: true,
+                    visualState: entry.currentShot.visualState
                 )
             )
         }
@@ -680,6 +710,16 @@ final class PDFSessionReportGenerator {
                 shots.captured_at_utc,
                 shots.original_filename,
                 shots.stamped_jpeg_filename,
+                shots.is_flagged,
+                CASE
+                    WHEN (
+                        (issues.resolved_at_utc IS NOT NULL AND TRIM(issues.resolved_at_utc) <> '')
+                        OR LOWER(TRIM(COALESCE(issues.current_status, ''))) = 'resolved'
+                    )
+                    AND COALESCE(NULLIF(TRIM(issues.last_capture_session_id), ''), shots.session_id) = shots.session_id
+                    THEN 1
+                    ELSE 0
+                END AS is_resolved_in_session,
                 COALESCE(
                     NULLIF(TRIM(shots.flagged_reason), ''),
                     NULLIF(TRIM(issues.previous_reason), ''),
@@ -1033,16 +1073,18 @@ final class PDFSessionReportGenerator {
                 kind: .sectionHeader,
                 text: headerText,
                 pageNumber: nil,
-                isFlagged: false
+                isFlagged: false,
+                visualState: .none
             ))
             for (index, entry) in section.entries.enumerated() {
                 let photoPageNumber = section.startPage + (index / 2)
                 let caption = captionIdentityLine(for: entry)
                 lines.append(DocumentationIndexLine(
                     kind: .photoItem,
-                    text: caption,
+                    text: entry.visualState == .resolved ? "\(caption) | Resolved" : caption,
                     pageNumber: photoPageNumber,
-                    isFlagged: entry.isFlagged
+                    isFlagged: entry.visualState != .none,
+                    visualState: entry.visualState
                 ))
             }
 
@@ -1051,14 +1093,16 @@ final class PDFSessionReportGenerator {
                     kind: .retiredSpacer,
                     text: "",
                     pageNumber: nil,
-                    isFlagged: false
+                    isFlagged: false,
+                    visualState: .none
                 ))
                 for retiredNote in section.retiredNotes {
                     lines.append(DocumentationIndexLine(
                         kind: .retiredNote,
                         text: retiredNote,
                         pageNumber: nil,
-                        isFlagged: false
+                        isFlagged: false,
+                        visualState: .none
                     ))
                 }
             }
@@ -1302,6 +1346,7 @@ final class PDFSessionReportGenerator {
                                 text: placed.line.text,
                                 in: textRect,
                                 font: .systemFont(ofSize: 9, weight: .regular),
+                                visualState: placed.line.visualState,
                                 alignment: .left
                             )
                         } else {
@@ -1432,8 +1477,8 @@ final class PDFSessionReportGenerator {
                         clipPath.addClip()
                         pdfContext.draw(image, in: fittedRect)
                         pdfContext.restoreGState()
-                        if entry.isFlagged {
-                            drawFlaggedBorder(around: fittedRect, in: pdfContext)
+                        if entry.visualState != .none {
+                            drawFlaggedBorder(around: fittedRect, in: pdfContext, visualState: entry.visualState)
                         }
                     } else {
                         if let imageURL = entry.imageURL {
@@ -1596,13 +1641,19 @@ final class PDFSessionReportGenerator {
 
         let capturedAt = entry.isSkipped ? " " : (formattedUTC(entry.capturedAtUTC) ?? "Unknown")
 
-        if entry.isFlagged {
+        if entry.visualState != .none {
             let flaggedReason = entry.flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let noteText = (flaggedReason?.isEmpty == false) ? flaggedReason! : "Flagged"
+            let noteText: String
+            if entry.visualState == .resolved {
+                noteText = (flaggedReason?.isEmpty == false) ? "Resolved - \(flaggedReason!)" : "Resolved"
+            } else {
+                noteText = (flaggedReason?.isEmpty == false) ? flaggedReason! : "Flagged"
+            }
             drawFlaggedNote(
                 text: noteText,
                 in: CGRect(x: rect.minX, y: secondLineY, width: rect.width, height: lineHeight),
                 font: bodyFont,
+                visualState: entry.visualState,
                 alignment: .center
             )
             drawText(
@@ -1757,13 +1808,13 @@ final class PDFSessionReportGenerator {
         return Self.parseUTCDate(raw) ?? .distantFuture
     }
 
-    private func drawFlaggedBorder(around rect: CGRect, in context: CGContext) {
+    private func drawFlaggedBorder(around rect: CGRect, in context: CGContext, visualState: ReportVisualState = .flagged) {
         let borderThickness: CGFloat = 3
         let borderOutset: CGFloat = 0.5
         let borderRect = rect.insetBy(dx: -borderOutset, dy: -borderOutset)
 
         context.saveGState()
-        context.setStrokeColor(NSColor(calibratedRed: 0.827, green: 0.184, blue: 0.184, alpha: 1.0).cgColor)
+        context.setStrokeColor(visualState.flagColor.cgColor)
         context.setLineWidth(borderThickness)
         let borderPath = CGPath(
             roundedRect: borderRect,
@@ -1780,6 +1831,7 @@ final class PDFSessionReportGenerator {
         text: String,
         in rect: CGRect,
         font: NSFont,
+        visualState: ReportVisualState = .flagged,
         alignment: NSTextAlignment
     ) {
         let paragraph = NSMutableParagraphStyle()
@@ -1791,7 +1843,7 @@ final class PDFSessionReportGenerator {
             string: "⚑ ",
             attributes: [
                 .font: font,
-                .foregroundColor: NSColor(calibratedRed: 0.827, green: 0.184, blue: 0.184, alpha: 1.0),
+                .foregroundColor: visualState.flagColor,
                 .paragraphStyle: paragraph,
             ]
         ))
@@ -2301,6 +2353,23 @@ final class PDFSessionReportGenerator {
         let guidedRows: [SessionReportGuidedRow]
     }
 
+    enum ReportVisualState: Equatable {
+        case none
+        case flagged
+        case resolved
+
+        var flagColor: NSColor {
+            switch self {
+            case .resolved:
+                return NSColor(calibratedRed: 0.149, green: 0.678, blue: 0.337, alpha: 1.0)
+            case .flagged:
+                return NSColor(calibratedRed: 0.827, green: 0.184, blue: 0.184, alpha: 1.0)
+            case .none:
+                return .black
+            }
+        }
+    }
+
     private struct FlaggedComparisonEntry {
         let currentShot: SessionReportShot
         let currentImageURL: URL?
@@ -2333,6 +2402,12 @@ final class PDFSessionReportGenerator {
         var isSkipped: Bool { guidedRow != nil }
         var skipReason: String? { guidedRow?.skipReason }
         var isFlagged: Bool { shot?.isFlagged == 1 }
+        var isResolvedInSession: Bool { shot?.isResolvedInSession == 1 }
+        var visualState: ReportVisualState {
+            if isResolvedInSession { return .resolved }
+            if isFlagged { return .flagged }
+            return .none
+        }
         var flaggedReason: String? { shot?.flaggedReason }
         var capturedAtUTC: String? { shot?.capturedAtUTC }
         var building: String? { shot?.building ?? guidedRow?.building }
@@ -2377,6 +2452,7 @@ final class PDFSessionReportGenerator {
         let text: String
         let pageNumber: Int?
         let isFlagged: Bool
+        let visualState: ReportVisualState
     }
 
     private struct DocumentationIndexPlacedLine {
@@ -2700,7 +2776,14 @@ private struct SessionReportShot: FetchableRecord, Decodable {
     let originalFilename: String
     let stampedJpegFilename: String?
     let isFlagged: Int
+    let isResolvedInSession: Int
     let flaggedReason: String?
+
+    var visualState: PDFSessionReportGenerator.ReportVisualState {
+        if isResolvedInSession == 1 { return .resolved }
+        if isFlagged == 1 { return .flagged }
+        return .none
+    }
 
     enum CodingKeys: String, CodingKey {
         case shotID = "shot_id"
@@ -2716,6 +2799,7 @@ private struct SessionReportShot: FetchableRecord, Decodable {
         case originalFilename = "original_filename"
         case stampedJpegFilename = "stamped_jpeg_filename"
         case isFlagged = "is_flagged"
+        case isResolvedInSession = "is_resolved_in_session"
         case flaggedReason = "flagged_reason"
     }
 }
@@ -2820,7 +2904,15 @@ private struct PreviousComparableShot: FetchableRecord, Decodable {
     let capturedAtUTC: String?
     let originalFilename: String
     let stampedJpegFilename: String?
+    let isFlagged: Int
+    let isResolvedInSession: Int
     let flaggedReason: String?
+
+    var visualState: PDFSessionReportGenerator.ReportVisualState {
+        if isResolvedInSession == 1 { return .resolved }
+        if isFlagged == 1 { return .flagged }
+        return .none
+    }
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
@@ -2833,6 +2925,8 @@ private struct PreviousComparableShot: FetchableRecord, Decodable {
         case capturedAtUTC = "captured_at_utc"
         case originalFilename = "original_filename"
         case stampedJpegFilename = "stamped_jpeg_filename"
+        case isFlagged = "is_flagged"
+        case isResolvedInSession = "is_resolved_in_session"
         case flaggedReason = "flagged_reason"
     }
 }

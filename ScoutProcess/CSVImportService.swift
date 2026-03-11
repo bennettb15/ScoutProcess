@@ -470,8 +470,10 @@ final class CSVImportService {
                     is_retired,
                     retired_at,
                     skip_reason,
-                    skip_session_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    skip_session_id,
+                    trade,
+                    priority
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guided_row_id) DO UPDATE SET
                     session_id = excluded.session_id,
                     property_id = excluded.property_id,
@@ -487,7 +489,9 @@ final class CSVImportService {
                     is_retired = excluded.is_retired,
                     retired_at = excluded.retired_at,
                     skip_reason = excluded.skip_reason,
-                    skip_session_id = excluded.skip_session_id
+                    skip_session_id = excluded.skip_session_id,
+                    trade = excluded.trade,
+                    priority = excluded.priority
                 """,
                 arguments: [
                     guidedRowID,
@@ -506,6 +510,8 @@ final class CSVImportService {
                     optionalValue(for: "retired_at", in: row, aliases: Self.guidedRowAliases),
                     optionalValue(for: "skip_reason", in: row, aliases: Self.guidedRowAliases),
                     optionalValue(for: "skip_session_id", in: row, aliases: Self.guidedRowAliases),
+                    optionalValue(for: "trade", in: row, aliases: Self.guidedRowAliases),
+                    optionalValue(for: "priority", in: row, aliases: Self.guidedRowAliases),
                 ]
             )
             upsertedCount += 1
@@ -640,8 +646,10 @@ final class CSVImportService {
                         original_filename,
                         original_byte_size,
                         stamped_jpeg_filename,
-                        flagged_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        flagged_reason,
+                        trade,
+                        priority
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id, logical_shot_identity) DO UPDATE SET
                         shot_id = excluded.shot_id,
                         session_id = excluded.session_id,
@@ -667,7 +675,9 @@ final class CSVImportService {
                         original_filename = excluded.original_filename,
                         original_byte_size = excluded.original_byte_size,
                         stamped_jpeg_filename = excluded.stamped_jpeg_filename,
-                        flagged_reason = excluded.flagged_reason
+                        flagged_reason = excluded.flagged_reason,
+                        trade = excluded.trade,
+                        priority = excluded.priority
                     """,
                     arguments: [
                         shotID,
@@ -695,6 +705,8 @@ final class CSVImportService {
                         integerValue(for: "original_byte_size", in: row, aliases: Self.shotAliases),
                         optionalValue(for: "stamped_jpeg_filename", in: row, aliases: Self.shotAliases),
                         optionalValue(for: "flagged_reason", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "trade", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "priority", in: row, aliases: Self.shotAliases),
                     ]
                 )
                 upsertedCount += 1
@@ -1166,6 +1178,8 @@ final class CSVImportService {
         "original_byte_size": ["original_byte_size", "originalbytesize"],
         "stamped_jpeg_filename": ["stamped_jpeg_filename", "stampedjpegfilename"],
         "flagged_reason": ["flagged_reason", "flaggedreason", "current_reason", "currentreason", "reason"],
+        "trade": ["trade"],
+        "priority": ["priority"],
     ]
 
     private static let guidedRowAliases: [String: [String]] = [
@@ -1185,6 +1199,8 @@ final class CSVImportService {
         "retired_at": ["retired_at", "retiredat"],
         "skip_reason": ["skip_reason", "skipreason"],
         "skip_session_id": ["skip_session_id", "skipsessionid"],
+        "trade": ["trade"],
+        "priority": ["priority"],
         "guided_key": ["guided_key", "guidedkey", "key"],
     ]
 

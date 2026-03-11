@@ -111,6 +111,12 @@ struct SessionManifest: Decodable {
     }
 }
 
+private enum StampFlagVisualState {
+    case none
+    case flagged
+    case resolved
+}
+
 final class ScoutProcessController {
     struct DiagnosticsSnapshot {
         let queueCount: Int
@@ -383,7 +389,7 @@ final class ScoutProcessController {
             onStateChange?(.error)
         }
 
-        _ = withStateLock {
+        withStateLock {
             isProcessing = false
         }
     }
@@ -462,6 +468,7 @@ final class ScoutProcessController {
             let sourceCatalog = buildSourceImageCatalog(in: originalsURL)
             var stampingErrors: [String] = []
             var usedOutputNames: Set<String> = []
+            let resolvedVisualIdentities = try resolvedShotIdentitySetForStamping(sessionID: importResult.sessionID)
 
             for (index, shot) in manifest.shots.enumerated() {
                 let sourceName = shot.originalFilename?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -482,7 +489,11 @@ final class ScoutProcessController {
                 }
 
                 let stampedName = uniqueStampedFilename(
-                    preferredName: makeStampedFilename(for: shot, session: manifest),
+                    preferredName: makeStampedFilename(
+                        for: shot,
+                        session: manifest,
+                        forceFlagSuffix: shouldShowFlagVisual(for: shot, session: manifest, resolvedIdentitySet: resolvedVisualIdentities)
+                    ),
                     sourceURL: sourceURL,
                     usedNames: &usedOutputNames
                 )
@@ -491,11 +502,12 @@ final class ScoutProcessController {
 
                 do {
                     let isFlagged = shot.isFlagged == true
+                    let visualState = stampVisualState(for: shot, session: manifest, resolvedIdentitySet: resolvedVisualIdentities)
                     try stampImage(
                         sourceURL: sourceURL,
                         destinationURL: destinationURL,
                         stampText: makeStampText(for: shot, session: manifest),
-                        isFlagged: isFlagged
+                        visualState: visualState
                     )
                     try validateStampedOutput(at: destinationURL)
                     try updateShotAssetMetadata(
@@ -906,7 +918,7 @@ final class ScoutProcessController {
         return "\(fields.elevation) | \(fields.angle) | \(fields.shotName) | \(fields.detailID) • \(fields.dateTime)".uppercased()
     }
 
-    private func makeStampedFilename(for shot: SessionManifest.Shot, session: SessionManifest) -> String {
+    private func makeStampedFilename(for shot: SessionManifest.Shot, session: SessionManifest, forceFlagSuffix: Bool = false) -> String {
         ScoutShotNaming.stampedJPEGFilename(
             building: shot.building ?? session.building,
             elevation: shot.elevation ?? session.elevation,
@@ -914,7 +926,7 @@ final class ScoutProcessController {
             angleIndex: shot.angleIndex,
             shotKey: shot.shotKey,
             shotName: shot.shotName,
-            isFlagged: shot.isFlagged == true
+            isFlagged: shot.isFlagged == true || forceFlagSuffix
         )
     }
 
@@ -942,7 +954,7 @@ final class ScoutProcessController {
         return rawValue
     }
 
-    private func stampImage(sourceURL: URL, destinationURL: URL, stampText: String, isFlagged: Bool) throws {
+    private func stampImage(sourceURL: URL, destinationURL: URL, stampText: String, visualState: StampFlagVisualState) throws {
         guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
               let original = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw ScoutProcessError.invalidImage(sourceURL.lastPathComponent)
@@ -985,13 +997,14 @@ final class ScoutProcessController {
         let sideMargin: CGFloat = isPortrait ? 40 : 36
         let cornerRadius: CGFloat = isPortrait ? 22 : 20
         let maxOverlayWidth = size.width - (sideMargin * 2)
-        let glyphGap: CGFloat = isFlagged ? 14 : 0
+        let showsFlagGlyph = visualState != .none
+        let glyphGap: CGFloat = showsFlagGlyph ? 14 : 0
         let textAttributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold),
             .foregroundColor: NSColor.white,
             .paragraphStyle: paragraph,
         ]
-        let glyphImage = isFlagged ? makeFlagGlyphImage(fontSize: fontSize) : nil
+        let glyphImage = showsFlagGlyph ? makeFlagGlyphImage(fontSize: fontSize, visualState: visualState) : nil
         let glyphSize = glyphImage?.size ?? .zero
 
         let resolvedStampText = fittedStampText(
@@ -1097,7 +1110,7 @@ final class ScoutProcessController {
         return "\(prefix)...\(detailAndDate)"
     }
 
-    private func makeFlagGlyphImage(fontSize: CGFloat) -> NSImage? {
+    private func makeFlagGlyphImage(fontSize: CGFloat, visualState: StampFlagVisualState) -> NSImage? {
         let symbolConfig = NSImage.SymbolConfiguration(pointSize: fontSize * 0.82, weight: .bold)
         guard let symbolImage = NSImage(systemSymbolName: "flag.fill", accessibilityDescription: "Flagged")?
             .withSymbolConfiguration(symbolConfig) else {
@@ -1106,10 +1119,64 @@ final class ScoutProcessController {
 
         let tintedImage = symbolImage.copy() as? NSImage ?? symbolImage
         tintedImage.lockFocus()
-        NSColor(calibratedRed: 0.827, green: 0.184, blue: 0.184, alpha: 1.0).set()
+        switch visualState {
+        case .resolved:
+            NSColor(calibratedRed: 0.149, green: 0.678, blue: 0.337, alpha: 1.0).set()
+        case .flagged:
+            NSColor(calibratedRed: 0.827, green: 0.184, blue: 0.184, alpha: 1.0).set()
+        case .none:
+            NSColor.white.set()
+        }
         NSRect(origin: .zero, size: tintedImage.size).fill(using: .sourceAtop)
         tintedImage.unlockFocus()
         return tintedImage
+    }
+
+    private func shouldShowFlagVisual(for shot: SessionManifest.Shot, session: SessionManifest, resolvedIdentitySet: Set<String>) -> Bool {
+        shot.isFlagged == true || stampVisualState(for: shot, session: session, resolvedIdentitySet: resolvedIdentitySet) == .resolved
+    }
+
+    private func stampVisualState(for shot: SessionManifest.Shot, session: SessionManifest, resolvedIdentitySet: Set<String>) -> StampFlagVisualState {
+        let identity = stampIdentity(for: shot, session: session)
+        if resolvedIdentitySet.contains(identity) {
+            return .resolved
+        }
+        if shot.isFlagged == true {
+            return .flagged
+        }
+        return .none
+    }
+
+    private func stampIdentity(for shot: SessionManifest.Shot, session: SessionManifest) -> String {
+        if let logical = shot.logicalShotIdentity?.trimmingCharacters(in: .whitespacesAndNewlines), logical.isEmpty == false {
+            return logical
+        }
+        if let key = shot.shotKey?.trimmingCharacters(in: .whitespacesAndNewlines), key.isEmpty == false {
+            return key
+        }
+        return "\(shot.detailType ?? session.detailType ?? "Shot") A\(shot.angleIndex ?? 0)"
+    }
+
+    private func resolvedShotIdentitySetForStamping(sessionID: String?) throws -> Set<String> {
+        guard let sessionID, let dbQueue = DatabaseManager.shared.dbQueue else { return [] }
+        return try dbQueue.read { db in
+            let identities = try String.fetchAll(
+                db,
+                sql: """
+                SELECT COALESCE(NULLIF(TRIM(s.logical_shot_identity), ''), NULLIF(TRIM(s.shot_key), ''), s.shot_id)
+                FROM shots s
+                LEFT JOIN issues i ON i.issue_id = s.issue_id
+                WHERE s.session_id = ?
+                  AND (
+                      (i.resolved_at_utc IS NOT NULL AND TRIM(i.resolved_at_utc) <> '')
+                      OR LOWER(TRIM(COALESCE(i.current_status, ''))) = 'resolved'
+                  )
+                  AND COALESCE(NULLIF(TRIM(i.last_capture_session_id), ''), s.session_id) = s.session_id
+                """,
+                arguments: [sessionID]
+            )
+            return Set(identities)
+        }
     }
 
     private func buildSourceImageCatalog(in originalsURL: URL) -> [String: [URL]] {
