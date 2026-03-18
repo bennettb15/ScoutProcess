@@ -376,9 +376,10 @@ final class CSVImportService {
                     schema_version,
                     app_version,
                     time_zone,
+                    capture_profile,
                     imported_at,
                     zip_name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     property_id = excluded.property_id,
                     org_id = excluded.org_id,
@@ -399,6 +400,7 @@ final class CSVImportService {
                     schema_version = excluded.schema_version,
                     app_version = excluded.app_version,
                     time_zone = excluded.time_zone,
+                    capture_profile = excluded.capture_profile,
                     imported_at = excluded.imported_at,
                     zip_name = excluded.zip_name
                 """,
@@ -423,6 +425,7 @@ final class CSVImportService {
                     optionalValue(for: "schema_version", in: row, aliases: Self.sessionAliases),
                     optionalValue(for: "app_version", in: row, aliases: Self.sessionAliases),
                     optionalValue(for: "time_zone", in: row, aliases: Self.sessionAliases),
+                    optionalValue(for: "capture_profile", in: row, aliases: Self.sessionAliases),
                     optionalValue(for: "imported_at", in: row, aliases: Self.sessionAliases) ?? importedAtNow,
                     zipName,
                 ]
@@ -645,11 +648,12 @@ final class CSVImportService {
                         lens,
                         original_filename,
                         original_byte_size,
+                        capture_profile,
                         stamped_jpeg_filename,
                         flagged_reason,
                         trade,
                         priority
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id, logical_shot_identity) DO UPDATE SET
                         shot_id = excluded.shot_id,
                         session_id = excluded.session_id,
@@ -674,6 +678,7 @@ final class CSVImportService {
                         lens = excluded.lens,
                         original_filename = excluded.original_filename,
                         original_byte_size = excluded.original_byte_size,
+                        capture_profile = excluded.capture_profile,
                         stamped_jpeg_filename = excluded.stamped_jpeg_filename,
                         flagged_reason = excluded.flagged_reason,
                         trade = excluded.trade,
@@ -703,6 +708,7 @@ final class CSVImportService {
                         optionalValue(for: "lens", in: row, aliases: Self.shotAliases),
                         fileName,
                         integerValue(for: "original_byte_size", in: row, aliases: Self.shotAliases),
+                        optionalValue(for: "capture_profile", in: row, aliases: Self.shotAliases),
                         optionalValue(for: "stamped_jpeg_filename", in: row, aliases: Self.shotAliases),
                         optionalValue(for: "flagged_reason", in: row, aliases: Self.shotAliases),
                         optionalValue(for: "trade", in: row, aliases: Self.shotAliases),
@@ -1149,6 +1155,7 @@ final class CSVImportService {
         "schema_version": ["schema_version", "schemaversion"],
         "app_version": ["app_version", "appversion"],
         "time_zone": ["time_zone", "timezone"],
+        "capture_profile": ["capture_profile", "captureprofile"],
         "imported_at": ["imported_at", "importedat"],
     ]
 
@@ -1176,6 +1183,7 @@ final class CSVImportService {
         "lens": ["lens"],
         "original_filename": ["original_filename", "originalfilename", "file_name", "filename", "file"],
         "original_byte_size": ["original_byte_size", "originalbytesize"],
+        "capture_profile": ["capture_profile", "captureprofile"],
         "stamped_jpeg_filename": ["stamped_jpeg_filename", "stampedjpegfilename"],
         "flagged_reason": ["flagged_reason", "flaggedreason", "current_reason", "currentreason", "reason"],
         "trade": ["trade"],
