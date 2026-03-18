@@ -27,6 +27,7 @@ struct SessionRecord: Codable, FetchableRecord, PersistableRecord {
     var schemaVersion: String?
     var appVersion: String?
     var timeZone: String?
+    var captureProfile: String?
     var importedAt: String
     var zipName: String?
 
@@ -53,6 +54,7 @@ struct SessionRecord: Codable, FetchableRecord, PersistableRecord {
         case schemaVersion = "schema_version"
         case appVersion = "app_version"
         case timeZone = "time_zone"
+        case captureProfile = "capture_profile"
         case importedAt = "imported_at"
         case zipName = "zip_name"
     }
@@ -86,6 +88,7 @@ struct ShotRecord: Codable, FetchableRecord, PersistableRecord {
     var flaggedReason: String?
     var trade: String?
     var priority: String?
+    var captureProfile: String?
 
     static let databaseTableName = "shots"
 
@@ -117,6 +120,7 @@ struct ShotRecord: Codable, FetchableRecord, PersistableRecord {
         case flaggedReason = "flagged_reason"
         case trade
         case priority
+        case captureProfile = "capture_profile"
     }
 }
 

@@ -77,6 +77,7 @@ struct SessionManifest: Decodable {
     var propertyNameAtCapture: String?
     var propertyId: String?
     var startedAt: String?
+    var captureProfile: String?
     var building: String?
     var elevation: String?
     var detailType: String?

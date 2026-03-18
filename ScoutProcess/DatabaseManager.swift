@@ -82,6 +82,7 @@ final class DatabaseManager {
                     schema_version TEXT,
                     app_version TEXT,
                     time_zone TEXT,
+                    capture_profile TEXT,
                     imported_at TEXT NOT NULL,
                     zip_name TEXT
                 )
@@ -122,6 +123,7 @@ final class DatabaseManager {
                     lens TEXT,
                     original_filename TEXT NOT NULL,
                     original_byte_size INTEGER,
+                    capture_profile TEXT,
                     trade TEXT,
                     priority TEXT
                 )
@@ -439,6 +441,18 @@ final class DatabaseManager {
             }
             if guidedRowColumnNames.contains("priority") == false {
                 try db.execute(sql: "ALTER TABLE guided_rows ADD COLUMN priority TEXT")
+            }
+        }
+
+        migrator.registerMigration("addCaptureProfileToCaptureTablesV1") { db in
+            let sessionColumnNames = try Set(db.columns(in: "sessions").map(\.name))
+            if sessionColumnNames.contains("capture_profile") == false {
+                try db.execute(sql: "ALTER TABLE sessions ADD COLUMN capture_profile TEXT")
+            }
+
+            let shotColumnNames = try Set(db.columns(in: "shots").map(\.name))
+            if shotColumnNames.contains("capture_profile") == false {
+                try db.execute(sql: "ALTER TABLE shots ADD COLUMN capture_profile TEXT")
             }
         }
 
