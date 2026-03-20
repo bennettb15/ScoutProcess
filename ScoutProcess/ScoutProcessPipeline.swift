@@ -168,6 +168,7 @@ final class ScoutProcessController {
     private var observations: [String: FileObservation] = [:]
 
     private let jpegQuality: CGFloat = 0.85
+    private let stampedJPEGMaxLongEdge: CGFloat = 2400
     private let stabilityInterval: TimeInterval = 0.75
     private let pollIntervalNanoseconds: UInt64 = 1_000_000_000
     private let enableSessionReportPDF = true
@@ -974,16 +975,18 @@ final class ScoutProcessController {
             throw ScoutProcessError.invalidImage(sourceURL.lastPathComponent)
         }
 
-        let size = CGSize(width: original.width, height: original.height)
-        guard size.width > 0, size.height > 0 else {
+        let originalSize = CGSize(width: original.width, height: original.height)
+        guard originalSize.width > 0, originalSize.height > 0 else {
             throw ScoutProcessError.invalidImage(sourceURL.lastPathComponent)
         }
+
+        let size = scaledStampedOutputSize(for: originalSize)
 
         let colorSpace = original.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
             data: nil,
-            width: original.width,
-            height: original.height,
+            width: Int(size.width),
+            height: Int(size.height),
             bitsPerComponent: 8,
             bytesPerRow: 0,
             space: colorSpace,
@@ -1003,16 +1006,18 @@ final class ScoutProcessController {
         paragraph.lineBreakMode = .byTruncatingTail
 
         let isPortrait = size.height > size.width
-        let fontSize: CGFloat = isPortrait ? 56 : 48
-        let pillHeight: CGFloat = isPortrait ? 108 : 96
-        let horizontalPadding: CGFloat = isPortrait ? 36 : 32
-        let verticalPadding: CGFloat = isPortrait ? 22 : 20
-        let bottomMargin: CGFloat = isPortrait ? 40 : 36
-        let sideMargin: CGFloat = isPortrait ? 40 : 36
-        let cornerRadius: CGFloat = isPortrait ? 22 : 20
+        let outputLongEdge = max(size.width, size.height)
+        let overlayScale = max(min(outputLongEdge / stampedJPEGMaxLongEdge, 1), 0.72)
+        let fontSize: CGFloat = max((isPortrait ? 49 : 42) * overlayScale, isPortrait ? 30 : 26)
+        let pillHeight: CGFloat = max((isPortrait ? 96 : 84) * overlayScale, isPortrait ? 70 : 64)
+        let horizontalPadding: CGFloat = max((isPortrait ? 30 : 27) * overlayScale, 20)
+        let verticalPadding: CGFloat = max((isPortrait ? 19 : 17) * overlayScale, 13)
+        let bottomMargin: CGFloat = max((isPortrait ? 36 : 32) * overlayScale, 22)
+        let sideMargin: CGFloat = max((isPortrait ? 36 : 32) * overlayScale, 22)
+        let cornerRadius: CGFloat = max((isPortrait ? 19 : 17) * overlayScale, 13)
         let maxOverlayWidth = size.width - (sideMargin * 2)
         let showsFlagGlyph = visualState != .none
-        let glyphGap: CGFloat = showsFlagGlyph ? 14 : 0
+        let glyphGap: CGFloat = showsFlagGlyph ? max(11 * overlayScale, 8) : 0
         let textAttributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold),
             .foregroundColor: NSColor.white,
@@ -1091,6 +1096,19 @@ final class ScoutProcessController {
         guard CGImageDestinationFinalize(destination) else {
             throw ScoutProcessError.invalidImage(destinationURL.lastPathComponent)
         }
+    }
+
+    private func scaledStampedOutputSize(for originalSize: CGSize) -> CGSize {
+        let longEdge = max(originalSize.width, originalSize.height)
+        guard longEdge > 0 else { return originalSize }
+        guard longEdge > stampedJPEGMaxLongEdge else {
+            return CGSize(width: round(originalSize.width), height: round(originalSize.height))
+        }
+
+        let scale = stampedJPEGMaxLongEdge / longEdge
+        let scaledWidth = max(1, Int(round(originalSize.width * scale)))
+        let scaledHeight = max(1, Int(round(originalSize.height * scale)))
+        return CGSize(width: scaledWidth, height: scaledHeight)
     }
 
     private func fittedStampText(
