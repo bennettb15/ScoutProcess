@@ -57,6 +57,7 @@ final class PDFSessionReportGenerator {
                     shots.building,
                     shots.elevation,
                     shots.detail_type,
+                    shots.priority,
                     shots.angle_index,
                     shots.shot_key,
                     shots.logical_shot_identity,
@@ -255,6 +256,105 @@ final class PDFSessionReportGenerator {
         return pdfURL
     }
 
+    func generatePriorityItemsReport(sessionID: String, extractedFolderURL: URL, zipName: String?) throws -> URL {
+        guard let dbQueue = databaseManager.dbQueue else {
+            throw PDFSessionReportError.databaseUnavailable
+        }
+
+        let reportContext = try dbQueue.read { db in
+            guard let session = try SessionReportSession.fetchOne(db, sql: """
+                SELECT
+                    session_id,
+                    property_id,
+                    org_name,
+                    folder_id,
+                    property_name,
+                    property_address,
+                    propertyStreet,
+                    propertyCity,
+                    propertyState,
+                    propertyZip,
+                    started_at_utc,
+                    ended_at_utc
+                FROM sessions
+                WHERE session_id = ?
+                """, arguments: [sessionID]) else {
+                throw PDFSessionReportError.sessionNotFound(sessionID)
+            }
+
+            let shots = try SessionReportShot.fetchAll(db, sql: """
+                SELECT
+                    shots.shot_id,
+                    shots.building,
+                    shots.elevation,
+                    shots.detail_type,
+                    shots.priority,
+                    shots.angle_index,
+                    shots.shot_key,
+                    shots.logical_shot_identity,
+                    shots.captured_at_utc,
+                    shots.latitude,
+                    shots.longitude,
+                    shots.original_filename,
+                    shots.stamped_jpeg_filename,
+                    shots.is_flagged,
+                    CASE
+                        WHEN (
+                            (issues.resolved_at_utc IS NOT NULL AND TRIM(issues.resolved_at_utc) <> '')
+                            OR LOWER(TRIM(COALESCE(issues.current_status, ''))) = 'resolved'
+                        )
+                        AND COALESCE(NULLIF(TRIM(issues.last_capture_session_id), ''), shots.session_id) = shots.session_id
+                        THEN 1
+                        ELSE 0
+                    END AS is_resolved_in_session,
+                    COALESCE(NULLIF(TRIM(shots.flagged_reason), ''), NULLIF(TRIM(issues.current_reason), '')) AS flagged_reason
+                FROM shots
+                LEFT JOIN issues ON issues.issue_id = shots.issue_id
+                WHERE shots.session_id = ?
+                ORDER BY captured_at_utc ASC, original_filename ASC
+                """, arguments: [sessionID])
+            let guidedRows = try SessionReportGuidedRow.fetchAll(db, sql: """
+                SELECT
+                    session_id,
+                    building,
+                    elevation,
+                    detail_type,
+                    angle_index,
+                    status,
+                    is_retired,
+                    retired_at,
+                    skip_reason,
+                    skip_session_id
+                FROM guided_rows
+                WHERE session_id = ?
+                ORDER BY rowid ASC
+                """, arguments: [sessionID])
+
+            return SessionReportContext(session: session, shots: shots, guidedRows: guidedRows)
+        }
+
+        let pdfFolder = try makePDFFolder(in: extractedFolderURL)
+        let pdfURL = pdfFolder.appending(path: makePriorityItemsPDFFileName(for: reportContext.session))
+        let imageCatalog = ImageCatalog(sessionFolderURL: extractedFolderURL, fileManager: fileManager)
+        let prioritySections = makePriorityReportSections(context: reportContext, imageCatalog: imageCatalog)
+
+        let flaggedItemCount = prioritySections.reduce(0) { $0 + $1.entries.count }
+        if flaggedItemCount == 0 {
+            throw PDFSessionReportError.noFlaggedItems(sessionID)
+        }
+
+        try renderPriorityItemsPDF(
+            context: reportContext,
+            prioritySections: prioritySections,
+            imageCatalog: imageCatalog,
+            pdfURL: pdfURL,
+            zipName: zipName
+        )
+
+        log("Priority items report generated: \(pdfURL.path(percentEncoded: false))")
+        return pdfURL
+    }
+
     private func makePDFFolder(in archivedSessionFolderURL: URL) throws -> URL {
         let pdfFolderURL = archivedSessionFolderURL.appendingPathComponent("PDF", isDirectory: true)
         try fileManager.createDirectory(at: pdfFolderURL, withIntermediateDirectories: true)
@@ -272,7 +372,14 @@ final class PDFSessionReportGenerator {
         let propertyName = sanitizeFileNameComponent(session.propertyName ?? "Unknown Property")
         let date = Self.parseUTCDate(session.startedAtUTC) ?? Date()
         let dateString = Self.fileDateFormatter.string(from: date)
-        return "Flagged Comparison Report - \(propertyName) - \(dateString).pdf"
+        return "Scout Flagged Comparison Report - \(propertyName) - \(dateString).pdf"
+    }
+
+    private func makePriorityItemsPDFFileName(for session: SessionReportSession) -> String {
+        let propertyName = sanitizeFileNameComponent(session.propertyName ?? "Unknown Property")
+        let date = Self.parseUTCDate(session.startedAtUTC) ?? Date()
+        let dateString = Self.fileDateFormatter.string(from: date)
+        return "Scout Priority Items Report - \(propertyName) - \(dateString).pdf"
     }
 
     private func renderPDF(
@@ -294,13 +401,12 @@ final class PDFSessionReportGenerator {
         let photoEntries = preparedEntries.entries
         let groupedPhotoSections = makeGroupedPhotoSections(
             from: photoEntries,
-            retiredNotesBySection: preparedEntries.retiredNotesBySection
+            retiredNotesBySection: preparedEntries.retiredNotesBySection,
+            orderedSectionKeys: preparedEntries.orderedSectionKeys
         )
         let coverImage: CGImage? = {
-            guard let firstEntry = photoEntries.first else { return nil }
-            guard firstEntry.isSkipped == false else { return nil }
-            guard resolvedAngleIndex(for: firstEntry) == 1 else { return nil }
-            guard let coverImageURL = firstEntry.imageURL else { return nil }
+            guard let firstShotEntry = preparedEntries.firstCapturedShotEntry else { return nil }
+            guard let coverImageURL = firstShotEntry.imageURL else { return nil }
             return loadOptimizedCGImage(at: coverImageURL)
         }()
 
@@ -446,6 +552,241 @@ final class PDFSessionReportGenerator {
         }
 
         pdfContext.closePDF()
+    }
+
+    private func renderPriorityItemsPDF(
+        context: SessionReportContext,
+        prioritySections: [PriorityReportSection],
+        imageCatalog: ImageCatalog,
+        pdfURL: URL,
+        zipName _: String?
+    ) throws {
+        guard let consumer = CGDataConsumer(url: pdfURL as CFURL) else {
+            throw PDFSessionReportError.pdfContextCreationFailed(pdfURL.path)
+        }
+
+        var mediaBox = CGRect(origin: .zero, size: Self.pageSize)
+        guard let pdfContext = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw PDFSessionReportError.pdfContextCreationFailed(pdfURL.path)
+        }
+
+        let coverImage: CGImage? = {
+            guard let firstShot = context.shots.first,
+                  let url = imageCatalog.resolveImage(for: firstShot)?.url
+            else { return nil }
+            return loadOptimizedCGImage(at: url)
+        }()
+
+        var pageNumber = 1
+        pdfContext.beginPDFPage(nil as CFDictionary?)
+        drawCoverPage(
+            in: pdfContext,
+            context: context,
+            pageNumber: pageNumber,
+            coverImage: coverImage,
+            title: "Priority Items Report"
+        )
+        pdfContext.endPDFPage()
+        pageNumber += 1
+
+        pdfContext.beginPDFPage(nil as CFDictionary?)
+        drawDocumentationScopePage(in: pdfContext, context: context, pageNumber: pageNumber)
+        pdfContext.endPDFPage()
+        pageNumber += 1
+
+        var assumedIndexPageCount = 1
+        var sectionPlans: [PriorityReportSectionPlan] = []
+        var indexPlans: [DocumentationIndexPagePlan] = []
+        for _ in 0..<3 {
+            let contentStartingPage = 3 + assumedIndexPageCount
+            sectionPlans = makePriorityReportSectionPlans(
+                from: prioritySections,
+                startingPage: contentStartingPage
+            )
+            let indexLines = makePriorityReportIndexLines(for: sectionPlans)
+            indexPlans = makeDocumentationIndexPagePlans(from: indexLines)
+            let resolvedCount = max(1, indexPlans.count)
+            if resolvedCount == assumedIndexPageCount {
+                break
+            }
+            assumedIndexPageCount = resolvedCount
+        }
+
+        if indexPlans.isEmpty {
+            indexPlans = [DocumentationIndexPagePlan(pageIndex: 0, lines: [])]
+        }
+
+        for plan in indexPlans {
+            pdfContext.beginPDFPage(nil as CFDictionary?)
+            drawDocumentationIndexPage(
+                in: pdfContext,
+                context: context,
+                pageNumber: pageNumber,
+                plan: plan
+            )
+            pdfContext.endPDFPage()
+            pageNumber += 1
+        }
+
+        for sectionPlan in sectionPlans {
+            pdfContext.beginPDFPage(nil as CFDictionary?)
+            drawPrioritySectionPage(
+                in: pdfContext,
+                context: context,
+                section: sectionPlan,
+                pageNumber: pageNumber
+            )
+            pdfContext.endPDFPage()
+            pageNumber += 1
+
+            for chunk in sectionPlan.pageChunks {
+                pdfContext.beginPDFPage(nil as CFDictionary?)
+                drawPriorityItemsPhotoPage(
+                    in: pdfContext,
+                    context: context,
+                    entries: chunk.entries,
+                    section: sectionPlan.section,
+                    pageNumber: pageNumber
+                )
+                pdfContext.endPDFPage()
+                pageNumber += 1
+            }
+        }
+
+        pdfContext.closePDF()
+    }
+
+    private func drawPrioritySectionPage(
+        in pdfContext: CGContext,
+        context: SessionReportContext,
+        section: PriorityReportSectionPlan,
+        pageNumber: Int
+    ) {
+        let bounds = CGRect(origin: .zero, size: Self.pageSize)
+        withGraphicsContext(pdfContext) {
+            NSColor.white.setFill()
+            bounds.fill()
+            drawCenteredHeaderLogo(in: bounds)
+
+            let titleRect = CGRect(x: 72, y: bounds.midY + 8, width: bounds.width - 144, height: 52)
+            drawText(
+                section.section.priority.label.uppercased(),
+                in: titleRect,
+                font: .systemFont(ofSize: 30, weight: .bold),
+                color: section.section.priority.color,
+                alignment: .center
+            )
+            drawText(
+                "Priority Items",
+                in: CGRect(x: 72, y: bounds.midY - 22, width: bounds.width - 144, height: 26),
+                font: .systemFont(ofSize: 18, weight: .medium),
+                color: .black,
+                alignment: .center
+            )
+            drawText(
+                "\(section.section.entries.count) flagged item\(section.section.entries.count == 1 ? "" : "s")",
+                in: CGRect(x: 72, y: bounds.midY - 56, width: bounds.width - 144, height: 20),
+                font: .systemFont(ofSize: 12, weight: .regular),
+                color: .darkGray,
+                alignment: .center
+            )
+
+            drawAddressFooter(
+                pageNumber: pageNumber,
+                in: bounds,
+                address: formattedAddress(for: context.session)
+            )
+        }
+    }
+
+    private func drawPriorityItemsPhotoPage(
+        in pdfContext: CGContext,
+        context: SessionReportContext,
+        entries: [PriorityReportEntry],
+        section: PriorityReportSection,
+        pageNumber: Int
+    ) {
+        let bounds = CGRect(origin: .zero, size: Self.pageSize)
+        withGraphicsContext(pdfContext) {
+            NSColor.white.setFill()
+            bounds.fill()
+            drawCenteredHeaderLogo(in: bounds)
+
+            let outerMargin: CGFloat = 18
+            let footerHeight: CGFloat = 82
+            let headerHeight: CGFloat = 18
+            let logoHeaderReserve: CGFloat = 34
+            let photoStackVerticalOffset: CGFloat = 28
+            let photoCaptionGap: CGFloat = 8
+            let metadataHeight: CGFloat = 66
+            let slotGap: CGFloat = 2
+
+            drawText(
+                "\(section.priority.label) Priority Items",
+                in: CGRect(
+                    x: outerMargin,
+                    y: bounds.height - outerMargin - 16,
+                    width: bounds.width - (outerMargin * 2),
+                    height: 16
+                ),
+                font: .systemFont(ofSize: 11, weight: .semibold),
+                color: section.priority.color
+            )
+
+            let contentTop = bounds.height - outerMargin - headerHeight - logoHeaderReserve - photoStackVerticalOffset
+            let contentBottom = outerMargin + footerHeight - photoStackVerticalOffset
+            let contentHeight = contentTop - contentBottom
+            let slotHeight = (contentHeight - slotGap) / 2
+            let slotWidth = bounds.width - (outerMargin * 2)
+
+            for (index, entry) in entries.enumerated() {
+                let slotTop = contentTop - CGFloat(index) * (slotHeight + slotGap)
+                let captionRect = CGRect(
+                    x: outerMargin,
+                    y: slotTop - slotHeight,
+                    width: slotWidth,
+                    height: metadataHeight
+                )
+                let photoAvailableRect = CGRect(
+                    x: outerMargin,
+                    y: captionRect.maxY + photoCaptionGap,
+                    width: slotWidth,
+                    height: slotHeight - metadataHeight - photoCaptionGap
+                )
+
+                if let imageURL = entry.imageURL, let image = loadOptimizedCGImage(at: imageURL) {
+                    let fittedRect = aspectFitRect(for: image, in: photoAvailableRect)
+                    pdfContext.saveGState()
+                    let clipPath = NSBezierPath(roundedRect: fittedRect, xRadius: 12, yRadius: 12)
+                    clipPath.addClip()
+                    pdfContext.draw(image, in: fittedRect)
+                    pdfContext.restoreGState()
+                    drawPriorityBorder(around: fittedRect, in: pdfContext, color: entry.priority.color)
+                } else {
+                    if let imageURL = entry.imageURL {
+                        log("Priority report warning: could not decode image \(imageURL.lastPathComponent)")
+                    }
+                    NSColor(white: 0.95, alpha: 1).setFill()
+                    photoAvailableRect.fill()
+                    drawText(
+                        "Image unavailable",
+                        in: photoAvailableRect,
+                        font: .systemFont(ofSize: 14, weight: .medium),
+                        color: .black,
+                        alignment: .center,
+                        verticalCenter: true
+                    )
+                }
+
+                drawPriorityMetadataBlock(for: entry, in: captionRect)
+            }
+
+            drawAddressFooter(
+                pageNumber: pageNumber,
+                in: bounds,
+                address: formattedAddress(for: context.session)
+            )
+        }
     }
 
     private func drawFlaggedComparisonPage(
@@ -635,6 +976,105 @@ final class PDFSessionReportGenerator {
         return lines
     }
 
+    private func makePriorityReportSections(
+        context: SessionReportContext,
+        imageCatalog: ImageCatalog
+    ) -> [PriorityReportSection] {
+        let flaggedShots = context.shots
+            .filter { $0.isFlagged == 1 }
+            .sorted(by: compareShotsByCaptureOrder)
+
+        let groupedByPriority = Dictionary(grouping: flaggedShots) { normalizedPriorityLevel($0.priority) }
+        let orderedPriorities = PriorityLevel.allCases.filter { groupedByPriority[$0]?.isEmpty == false }
+
+        return orderedPriorities.map { priority in
+            let shots = groupedByPriority[priority] ?? []
+            let orderedElevationKeys = orderedSectionKeys(for: shots)
+            let entries = shots
+                .map { shot in
+                    PriorityReportEntry(
+                        shot: shot,
+                        imageURL: imageCatalog.resolveImage(for: shot)?.url,
+                        priority: priority
+                    )
+                }
+                .sorted { lhs, rhs in
+                    comparePriorityReportEntries(lhs, rhs, orderedSectionKeys: orderedElevationKeys)
+                }
+
+            return PriorityReportSection(priority: priority, entries: entries)
+        }
+    }
+
+    private func makePriorityReportSectionPlans(
+        from sections: [PriorityReportSection],
+        startingPage: Int
+    ) -> [PriorityReportSectionPlan] {
+        var plans: [PriorityReportSectionPlan] = []
+        var nextPage = startingPage
+
+        for section in sections {
+            let sectionPage = nextPage
+            nextPage += 1
+
+            var chunks: [PriorityReportChunkPlan] = []
+            for chunkStart in stride(from: 0, to: section.entries.count, by: 2) {
+                let chunkEntries = Array(section.entries[chunkStart..<min(chunkStart + 2, section.entries.count)])
+                chunks.append(PriorityReportChunkPlan(pageNumber: nextPage, entries: chunkEntries))
+                nextPage += 1
+            }
+
+            let endPage = chunks.last?.pageNumber ?? sectionPage
+            plans.append(
+                PriorityReportSectionPlan(
+                    section: section,
+                    sectionPage: sectionPage,
+                    pageChunks: chunks,
+                    startPage: sectionPage,
+                    endPage: endPage
+                )
+            )
+        }
+
+        return plans
+    }
+
+    private func makePriorityReportIndexLines(for sectionPlans: [PriorityReportSectionPlan]) -> [DocumentationIndexLine] {
+        var lines: [DocumentationIndexLine] = []
+        for section in sectionPlans {
+            let headerText: String
+            if section.pageChunks.isEmpty {
+                headerText = "\(section.section.priority.label) Priority Items page \(section.sectionPage)"
+            } else {
+                headerText = "\(section.section.priority.label) Priority Items pages \(section.startPage)-\(section.endPage)"
+            }
+            lines.append(
+                DocumentationIndexLine(
+                    kind: .sectionHeader,
+                    text: headerText,
+                    pageNumber: nil,
+                    isFlagged: false,
+                    visualState: .none
+                )
+            )
+
+            for (index, entry) in section.section.entries.enumerated() {
+                let pageNumber = section.pageChunks[safe: index / 2]?.pageNumber ?? section.sectionPage
+                let text = "\(captionIdentityLine(for: entry.shot)) | \(entry.priority.label)"
+                lines.append(
+                    DocumentationIndexLine(
+                        kind: .photoItem,
+                        text: text,
+                        pageNumber: pageNumber,
+                        isFlagged: true,
+                        visualState: .flagged
+                    )
+                )
+            }
+        }
+        return lines
+    }
+
     private func makeDocumentationIndexPagePlans(from lines: [DocumentationIndexLine]) -> [DocumentationIndexPagePlan] {
         if lines.isEmpty { return [] }
         let leftMargin: CGFloat = 64
@@ -689,6 +1129,49 @@ final class PDFSessionReportGenerator {
             shot.capturedAtUTC ?? "",
             shot.originalFilename,
         ]
+    }
+
+    private func compareShotsByCaptureOrder(_ lhs: SessionReportShot, _ rhs: SessionReportShot) -> Bool {
+        let lhsDate = parseCapturedDate(lhs.capturedAtUTC)
+        let rhsDate = parseCapturedDate(rhs.capturedAtUTC)
+        if lhsDate != rhsDate {
+            return lhsDate < rhsDate
+        }
+        return lhs.originalFilename.localizedCaseInsensitiveCompare(rhs.originalFilename) == .orderedAscending
+    }
+
+    private func orderedSectionKeys(for shots: [SessionReportShot]) -> [String] {
+        var orderedKeys: [String] = []
+        var seenKeys = Set<String>()
+
+        for shot in shots.sorted(by: compareShotsByCaptureOrder) {
+            let key = sectionGroupingKey(building: shot.building, elevation: shot.elevation)
+            if seenKeys.insert(key).inserted {
+                orderedKeys.append(key)
+            }
+        }
+
+        return orderedKeys
+    }
+
+    private func comparePriorityReportEntries(
+        _ lhs: PriorityReportEntry,
+        _ rhs: PriorityReportEntry,
+        orderedSectionKeys: [String]
+    ) -> Bool {
+        let lhsSectionIndex = orderedSectionKeys.firstIndex(of: sectionGroupingKey(building: lhs.shot.building, elevation: lhs.shot.elevation)) ?? Int.max
+        let rhsSectionIndex = orderedSectionKeys.firstIndex(of: sectionGroupingKey(building: rhs.shot.building, elevation: rhs.shot.elevation)) ?? Int.max
+        if lhsSectionIndex != rhsSectionIndex {
+            return lhsSectionIndex < rhsSectionIndex
+        }
+
+        let lhsDate = parseCapturedDate(lhs.shot.capturedAtUTC)
+        let rhsDate = parseCapturedDate(rhs.shot.capturedAtUTC)
+        if lhsDate != rhsDate {
+            return lhsDate < rhsDate
+        }
+
+        return lhs.shot.originalFilename.localizedCaseInsensitiveCompare(rhs.shot.originalFilename) == .orderedAscending
     }
 
     private func fetchPreviousComparableShot(
@@ -873,6 +1356,8 @@ final class PDFSessionReportGenerator {
             }
         }
 
+        let orderedSectionKeys = makeOrderedSectionKeys(context: context)
+
         var entries: [SessionReportPhotoEntry] = context.shots.compactMap { shot in
             let computedSlotKey = slotKey(
                 building: shot.building,
@@ -919,14 +1404,23 @@ final class PDFSessionReportGenerator {
             }
         }
 
-        entries.sort(by: comparePhotoEntries)
+        let firstCapturedShotEntry = entries.first(where: { $0.isSkipped == false })
+        entries.sort { lhs, rhs in
+            comparePhotoEntries(lhs, rhs, orderedSectionKeys: orderedSectionKeys)
+        }
 
-        return PreparedPhotoEntries(entries: entries, retiredNotesBySection: retiredNotesBySection)
+        return PreparedPhotoEntries(
+            entries: entries,
+            retiredNotesBySection: retiredNotesBySection,
+            orderedSectionKeys: orderedSectionKeys,
+            firstCapturedShotEntry: firstCapturedShotEntry
+        )
     }
 
     private func makeGroupedPhotoSections(
         from entries: [SessionReportPhotoEntry],
-        retiredNotesBySection: [String: [String]]
+        retiredNotesBySection: [String: [String]],
+        orderedSectionKeys: [String]
     ) -> [GroupedPhotoSection] {
         var orderedKeys: [String] = []
         var groupedEntries: [String: [SessionReportPhotoEntry]] = [:]
@@ -938,14 +1432,21 @@ final class PDFSessionReportGenerator {
             let key = sectionGroupingKey(building: building, elevation: elevation)
 
             if groupedEntries[key] == nil {
-                orderedKeys.append(key)
                 groupedMeta[key] = (building: building, elevation: elevation)
                 groupedEntries[key] = []
             }
             groupedEntries[key, default: []].append(entry)
         }
 
-        for key in retiredNotesBySection.keys where orderedKeys.contains(key) == false {
+        for key in orderedSectionKeys where groupedMeta[key] != nil {
+            orderedKeys.append(key)
+        }
+
+        for key in groupedEntries.keys.sorted() where orderedKeys.contains(key) == false {
+            orderedKeys.append(key)
+        }
+
+        for key in retiredNotesBySection.keys.sorted() where orderedKeys.contains(key) == false {
             orderedKeys.append(key)
             if groupedMeta[key] == nil {
                 let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
@@ -1743,24 +2244,24 @@ final class PDFSessionReportGenerator {
         ].joined(separator: "|")
     }
 
-    private func comparePhotoEntries(_ lhs: SessionReportPhotoEntry, _ rhs: SessionReportPhotoEntry) -> Bool {
-        let lhsBuilding = buildingSortKey(lhs.building)
-        let rhsBuilding = buildingSortKey(rhs.building)
-        if lhsBuilding.sortText != rhsBuilding.sortText {
-            return lhsBuilding.sortText < rhsBuilding.sortText
-        }
-        if lhsBuilding.number != rhsBuilding.number {
-            return lhsBuilding.number < rhsBuilding.number
-        }
-
-        let lhsElevation = displayText(lhs.elevation, fallback: "Unknown").uppercased()
-        let rhsElevation = displayText(rhs.elevation, fallback: "Unknown").uppercased()
-        if lhsElevation != rhsElevation {
-            return lhsElevation < rhsElevation
+    private func comparePhotoEntries(
+        _ lhs: SessionReportPhotoEntry,
+        _ rhs: SessionReportPhotoEntry,
+        orderedSectionKeys: [String]
+    ) -> Bool {
+        let lhsSectionIndex = sectionOrderIndex(for: lhs, orderedSectionKeys: orderedSectionKeys)
+        let rhsSectionIndex = sectionOrderIndex(for: rhs, orderedSectionKeys: orderedSectionKeys)
+        if lhsSectionIndex != rhsSectionIndex {
+            return lhsSectionIndex < rhsSectionIndex
         }
 
         let lhsDetail = displayText(lhs.detailType, fallback: "General Elevation").uppercased()
         let rhsDetail = displayText(rhs.detailType, fallback: "General Elevation").uppercased()
+        let lhsDetailPriority = detailSortPriority(lhsDetail)
+        let rhsDetailPriority = detailSortPriority(rhsDetail)
+        if lhsDetailPriority != rhsDetailPriority {
+            return lhsDetailPriority < rhsDetailPriority
+        }
         if lhsDetail != rhsDetail {
             return lhsDetail < rhsDetail
         }
@@ -1782,6 +2283,46 @@ final class PDFSessionReportGenerator {
         }
 
         return lhs.originalFilename.localizedCaseInsensitiveCompare(rhs.originalFilename) == .orderedAscending
+    }
+
+    private func makeOrderedSectionKeys(context: SessionReportContext) -> [String] {
+        var orderedKeys: [String] = []
+        var seenKeys = Set<String>()
+
+        for shot in context.shots {
+            let key = sectionGroupingKey(building: shot.building, elevation: shot.elevation)
+            if seenKeys.insert(key).inserted {
+                orderedKeys.append(key)
+            }
+        }
+
+        for guidedRow in context.guidedRows {
+            let key = sectionGroupingKey(building: guidedRow.building, elevation: guidedRow.elevation)
+            if seenKeys.insert(key).inserted {
+                orderedKeys.append(key)
+            }
+        }
+
+        return orderedKeys
+    }
+
+    private func sectionOrderIndex(
+        for entry: SessionReportPhotoEntry,
+        orderedSectionKeys: [String]
+    ) -> Int {
+        let key = sectionGroupingKey(building: entry.building, elevation: entry.elevation)
+        return orderedSectionKeys.firstIndex(of: key) ?? Int.max
+    }
+
+    private func detailSortPriority(_ normalizedDetailType: String) -> Int {
+        switch normalizedDetailType {
+        case "OVERVIEW":
+            return 0
+        case "ELEVATION":
+            return 1
+        default:
+            return 2
+        }
     }
 
     private func resolvedAngleIndex(for entry: SessionReportPhotoEntry) -> Int {
@@ -1809,12 +2350,16 @@ final class PDFSessionReportGenerator {
     }
 
     private func drawFlaggedBorder(around rect: CGRect, in context: CGContext, visualState: ReportVisualState = .flagged) {
+        drawPriorityBorder(around: rect, in: context, color: visualState.flagColor)
+    }
+
+    private func drawPriorityBorder(around rect: CGRect, in context: CGContext, color: NSColor) {
         let borderThickness: CGFloat = 3
         let borderOutset: CGFloat = 0.5
         let borderRect = rect.insetBy(dx: -borderOutset, dy: -borderOutset)
 
         context.saveGState()
-        context.setStrokeColor(visualState.flagColor.cgColor)
+        context.setStrokeColor(color.cgColor)
         context.setLineWidth(borderThickness)
         let borderPath = CGPath(
             roundedRect: borderRect,
@@ -1856,6 +2401,89 @@ final class PDFSessionReportGenerator {
             ]
         ))
         note.draw(in: rect)
+    }
+
+    private func drawPriorityFlaggedNote(
+        priority: PriorityLevel,
+        flaggedReason: String?,
+        in rect: CGRect,
+        font: NSFont,
+        alignment: NSTextAlignment
+    ) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = alignment
+        paragraph.lineBreakMode = .byTruncatingTail
+
+        let reason = flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayReason = (reason?.isEmpty == false) ? reason! : "No reason provided"
+        let note = NSMutableAttributedString()
+        note.append(NSAttributedString(
+            string: "● ",
+            attributes: [
+                .font: font,
+                .foregroundColor: priority.color,
+                .paragraphStyle: paragraph,
+            ]
+        ))
+        note.append(NSAttributedString(
+            string: "\(priority.label) - ",
+            attributes: [
+                .font: font,
+                .foregroundColor: NSColor.black,
+                .paragraphStyle: paragraph,
+            ]
+        ))
+        note.append(NSAttributedString(
+            string: "⚑",
+            attributes: [
+                .font: font,
+                .foregroundColor: ReportVisualState.flagged.flagColor,
+                .paragraphStyle: paragraph,
+            ]
+        ))
+        note.append(NSAttributedString(
+            string: " - \(displayReason)",
+            attributes: [
+                .font: font,
+                .foregroundColor: NSColor.black,
+                .paragraphStyle: paragraph,
+            ]
+        ))
+        note.draw(in: rect)
+    }
+
+    private func drawPriorityMetadataBlock(for entry: PriorityReportEntry, in rect: CGRect) {
+        let titleFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        let bodyFont = NSFont.systemFont(ofSize: 10, weight: .regular)
+        let lineHeight: CGFloat = 14
+        let topY = rect.maxY - lineHeight
+        let secondLineY = topY - lineHeight
+        let thirdLineY = topY - (lineHeight * 2)
+
+        drawText(
+            captionIdentityLine(for: entry.shot),
+            in: CGRect(x: rect.minX, y: topY, width: rect.width, height: lineHeight),
+            font: titleFont,
+            alignment: .center
+        )
+        drawPriorityFlaggedNote(
+            priority: entry.priority,
+            flaggedReason: entry.shot.flaggedReason,
+            in: CGRect(x: rect.minX, y: secondLineY, width: rect.width, height: lineHeight),
+            font: bodyFont,
+            alignment: .center
+        )
+        drawText(
+            formattedUTC(entry.shot.capturedAtUTC) ?? "Unknown",
+            in: CGRect(x: rect.minX, y: thirdLineY, width: rect.width, height: lineHeight),
+            font: bodyFont,
+            color: .black,
+            alignment: .center
+        )
+    }
+
+    private func normalizedPriorityLevel(_ rawPriority: String?) -> PriorityLevel {
+        PriorityLevel(rawValue: rawPriority?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "") ?? .medium
     }
 
     private func drawCenteredHeaderLogo(in bounds: CGRect) {
@@ -2370,6 +2998,35 @@ final class PDFSessionReportGenerator {
         }
     }
 
+    private enum PriorityLevel: String, CaseIterable {
+        case critical
+        case high
+        case medium
+        case low
+
+        var label: String {
+            switch self {
+            case .critical: return "Critical"
+            case .high: return "High"
+            case .medium: return "Medium"
+            case .low: return "Low"
+            }
+        }
+
+        var color: NSColor {
+            switch self {
+            case .critical:
+                return NSColor(calibratedRed: 0.827, green: 0.184, blue: 0.184, alpha: 1.0)
+            case .high:
+                return NSColor(calibratedRed: 0.925, green: 0.486, blue: 0.156, alpha: 1.0)
+            case .medium:
+                return NSColor(calibratedRed: 0.855, green: 0.655, blue: 0.128, alpha: 1.0)
+            case .low:
+                return NSColor(calibratedRed: 0.184, green: 0.482, blue: 0.875, alpha: 1.0)
+            }
+        }
+    }
+
     private struct FlaggedComparisonEntry {
         let currentShot: SessionReportShot
         let currentImageURL: URL?
@@ -2380,6 +3037,30 @@ final class PDFSessionReportGenerator {
         let previousDateText: String
         let currentMonthYear: String
         let previousMonthYear: String
+    }
+
+    private struct PriorityReportEntry {
+        let shot: SessionReportShot
+        let imageURL: URL?
+        let priority: PriorityLevel
+    }
+
+    private struct PriorityReportSection {
+        let priority: PriorityLevel
+        let entries: [PriorityReportEntry]
+    }
+
+    private struct PriorityReportChunkPlan {
+        let pageNumber: Int
+        let entries: [PriorityReportEntry]
+    }
+
+    private struct PriorityReportSectionPlan {
+        let section: PriorityReportSection
+        let sectionPage: Int
+        let pageChunks: [PriorityReportChunkPlan]
+        let startPage: Int
+        let endPage: Int
     }
 
     private struct SessionReportPhotoEntry {
@@ -2468,6 +3149,8 @@ final class PDFSessionReportGenerator {
     private struct PreparedPhotoEntries {
         let entries: [SessionReportPhotoEntry]
         let retiredNotesBySection: [String: [String]]
+        let orderedSectionKeys: [String]
+        let firstCapturedShotEntry: SessionReportPhotoEntry?
     }
 
     private struct ImageCatalog {
@@ -2767,6 +3450,7 @@ private struct SessionReportShot: FetchableRecord, Decodable {
     let building: String?
     let elevation: String?
     let detailType: String?
+    let priority: String?
     let angleIndex: Int?
     let shotKey: String?
     let logicalShotIdentity: String?
@@ -2790,6 +3474,7 @@ private struct SessionReportShot: FetchableRecord, Decodable {
         case building
         case elevation
         case detailType = "detail_type"
+        case priority
         case angleIndex = "angle_index"
         case shotKey = "shot_key"
         case logicalShotIdentity = "logical_shot_identity"

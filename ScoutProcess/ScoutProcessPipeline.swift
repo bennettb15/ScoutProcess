@@ -584,6 +584,19 @@ final class ScoutProcessController {
                     } catch {
                         log("Flagged comparison report generation failed for session \(importedSessionID): \(error.localizedDescription)")
                     }
+
+                    do {
+                        let priorityPDFURL = try PDFSessionReportGenerator().generatePriorityItemsReport(
+                            sessionID: importedSessionID,
+                            extractedFolderURL: archivedSessionURL,
+                            zipName: workingZipURL.lastPathComponent
+                        )
+                        log("Priority items report created at \(priorityPDFURL.path(percentEncoded: false))")
+                    } catch PDFSessionReportError.noFlaggedItems {
+                        log("Priority items report skipped: no flagged items in session \(importedSessionID).")
+                    } catch {
+                        log("Priority items report generation failed for session \(importedSessionID): \(error.localizedDescription)")
+                    }
                 } else {
                     log("Flagged comparison report generation skipped: imported session ID was unavailable.")
                 }
