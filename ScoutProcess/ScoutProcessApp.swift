@@ -26,5 +26,18 @@ struct ScoutProcessApp: App {
                     model.stop()
                 }
         }
+        .commands {
+            CommandGroup(after: .newItem) {
+                Divider()
+
+                Button("Change Scout Archive Path...") {
+                    model.chooseArchiveLocation()
+                }
+
+                Button("Change Scout Deliverables Path...") {
+                    model.chooseDeliverablesLocation()
+                }
+            }
+        }
     }
 }

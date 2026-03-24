@@ -18,13 +18,17 @@ struct ScoutProcessDirectories {
     let failed: URL
     let duplicate: URL
     let archiveRoot: URL
-    let clientsRoot: URL
+    let archiveClientsRoot: URL
+    let deliverablesRoot: URL
+    let deliverablesClientsRoot: URL
 
     static func defaultDirectories() -> Self {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let base = docs.appending(path: "ScoutProcess", directoryHint: .isDirectory)
-        let archiveRoot = docs.appending(path: "ScoutArchive", directoryHint: .isDirectory)
-        let clientsRoot = archiveRoot.appending(path: "Clients", directoryHint: .isDirectory)
+        let archiveRoot = ScoutProcessLocationSettings.archiveRootURL()
+        let archiveClientsRoot = archiveRoot.appending(path: "Clients", directoryHint: .isDirectory)
+        let deliverablesRoot = ScoutProcessLocationSettings.deliverablesRootURL()
+        let deliverablesClientsRoot = deliverablesRoot.appending(path: "Clients", directoryHint: .isDirectory)
         return Self(
             base: base,
             input: base.appending(path: "Input", directoryHint: .isDirectory),
@@ -32,7 +36,9 @@ struct ScoutProcessDirectories {
             failed: base.appending(path: "Failed", directoryHint: .isDirectory),
             duplicate: base.appending(path: "Duplicate", directoryHint: .isDirectory),
             archiveRoot: archiveRoot,
-            clientsRoot: clientsRoot
+            archiveClientsRoot: archiveClientsRoot,
+            deliverablesRoot: deliverablesRoot,
+            deliverablesClientsRoot: deliverablesClientsRoot
         )
     }
 }
@@ -128,9 +134,14 @@ final class ScoutProcessController {
 
     struct SessionArchiveMetadata {
         let orgNameResolved: String
-        let folderId: String
         let propertyNameResolved: String
+        let propertyStreetResolved: String
         let sessionDate: String
+    }
+
+    struct ArchivedSessionDestinations {
+        let archiveSessionFolder: URL
+        let deliverablesSessionFolder: URL
     }
 
     struct QueueUpdate {
@@ -236,7 +247,17 @@ final class ScoutProcessController {
     }
 
     private func createDirectoriesIfNeeded() {
-        for directory in [directories.base, directories.input, directories.working, directories.failed, directories.duplicate, directories.archiveRoot, directories.clientsRoot] {
+        for directory in [
+            directories.base,
+            directories.input,
+            directories.working,
+            directories.failed,
+            directories.duplicate,
+            directories.archiveRoot,
+            directories.archiveClientsRoot,
+            directories.deliverablesRoot,
+            directories.deliverablesClientsRoot
+        ] {
             do {
                 try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
             } catch {
@@ -437,7 +458,7 @@ final class ScoutProcessController {
             let originalsURL = resolvedSessionFolder.appending(path: "Originals", directoryHint: .isDirectory)
 
             let manifest = try loadManifest(at: sessionJSONURL)
-            let archiveMetadata = try extractArchiveMetadata(from: manifest)
+            let archiveMetadata = try extractArchiveMetadata(from: manifest, sessionFolderURL: resolvedSessionFolder)
 
             let importResult: CSVImportSessionResult
             do {
@@ -542,10 +563,12 @@ final class ScoutProcessController {
             }
 
             lastStep = "routing archived session"
-            let archivedSessionURL = try archiveSessionFolder(
+            let archivedDestinations = try archiveSessionFolder(
                 from: resolvedSessionFolder,
                 metadata: archiveMetadata
             )
+            let archivedSessionURL = archivedDestinations.archiveSessionFolder
+            let deliverablesSessionURL = archivedDestinations.deliverablesSessionFolder
 
             if enableSessionReportPDF {
                 let resolvedSessionIDForPDF = importResult.sessionID
@@ -557,7 +580,8 @@ final class ScoutProcessController {
                     do {
                         let pdfURL = try PDFSessionReportGenerator().generateSessionReport(
                             sessionID: importedSessionID,
-                            extractedFolderURL: archivedSessionURL,
+                            imageFolderURLs: [deliverablesSessionURL, archivedSessionURL],
+                            outputFolderURL: deliverablesSessionURL,
                             zipName: workingZipURL.lastPathComponent
                         )
                         log("Session report created at \(pdfURL.path(percentEncoded: false))")
@@ -576,7 +600,8 @@ final class ScoutProcessController {
                     do {
                         let comparisonPDFURL = try PDFSessionReportGenerator().generateFlaggedComparisonReport(
                             sessionID: importedSessionID,
-                            extractedFolderURL: archivedSessionURL,
+                            imageFolderURLs: [deliverablesSessionURL, archivedSessionURL],
+                            outputFolderURL: deliverablesSessionURL,
                             zipName: workingZipURL.lastPathComponent
                         )
                         log("Flagged comparison report created at \(comparisonPDFURL.path(percentEncoded: false))")
@@ -589,7 +614,8 @@ final class ScoutProcessController {
                     do {
                         let priorityPDFURL = try PDFSessionReportGenerator().generatePriorityItemsReport(
                             sessionID: importedSessionID,
-                            extractedFolderURL: archivedSessionURL,
+                            imageFolderURLs: [deliverablesSessionURL, archivedSessionURL],
+                            outputFolderURL: deliverablesSessionURL,
                             zipName: workingZipURL.lastPathComponent
                         )
                         log("Priority items report created at \(priorityPDFURL.path(percentEncoded: false))")
@@ -616,7 +642,7 @@ final class ScoutProcessController {
                 )
             }
 
-            return PipelineResult(processedFolder: archivedSessionURL)
+            return PipelineResult(processedFolder: deliverablesSessionURL)
         } catch {
             let failureSourceURL = bestFailureSourceURL(for: sessionFolder)
             let failedSessionURL = uniqueDestinationURL(in: directories.failed, preferredName: failureSourceURL.lastPathComponent)
@@ -686,18 +712,18 @@ final class ScoutProcessController {
         return destination
     }
 
-    private func extractArchiveMetadata(from manifest: SessionManifest) throws -> SessionArchiveMetadata {
+    private func extractArchiveMetadata(from manifest: SessionManifest, sessionFolderURL: URL) throws -> SessionArchiveMetadata {
         let orgName = try sanitizeFolderComponent(
             manifest.orgNameAtCapture ?? manifest.orgName,
             requiredField: "orgName"
         )
-        let folderId = try requiredMetadataValue(
-            manifest.folderId ?? manifest.folderIDAtCapture,
-            fieldName: "folderId"
-        )
         let propertyName = try sanitizeFolderComponent(
             manifest.propertyNameAtCapture ?? manifest.propertyName,
             requiredField: "propertyName"
+        )
+        let propertyStreet = try sanitizeFolderComponent(
+            resolvePropertyStreet(from: sessionFolderURL),
+            requiredField: "propertyStreet"
         )
 
         let dateSource = manifest.startedAt
@@ -710,8 +736,8 @@ final class ScoutProcessController {
 
         return SessionArchiveMetadata(
             orgNameResolved: orgName,
-            folderId: folderId,
             propertyNameResolved: propertyName,
+            propertyStreetResolved: propertyStreet,
             sessionDate: Self.archiveDateFormatter.string(from: date)
         )
     }
@@ -719,19 +745,28 @@ final class ScoutProcessController {
     private func archiveSessionFolder(
         from sourceSessionFolder: URL,
         metadata: SessionArchiveMetadata
-    ) throws -> URL {
-        let orgFolder = directories.clientsRoot.appending(path: metadata.orgNameResolved, directoryHint: .isDirectory)
-        let propertyFolderName = "\(metadata.folderId) \(metadata.propertyNameResolved)"
-        let propertyFolder = orgFolder.appending(path: propertyFolderName, directoryHint: .isDirectory)
+    ) throws -> ArchivedSessionDestinations {
+        let propertyFolderName = "\(metadata.propertyNameResolved) - \(metadata.propertyStreetResolved)"
+        let archiveOrgFolder = directories.archiveClientsRoot.appending(path: metadata.orgNameResolved, directoryHint: .isDirectory)
+        let archivePropertyFolder = archiveOrgFolder.appending(path: propertyFolderName, directoryHint: .isDirectory)
+        let deliverablesOrgFolder = directories.deliverablesClientsRoot.appending(path: metadata.orgNameResolved, directoryHint: .isDirectory)
+        let deliverablesPropertyFolder = deliverablesOrgFolder.appending(path: propertyFolderName, directoryHint: .isDirectory)
 
-        try fileManager.createDirectory(at: propertyFolder, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: archivePropertyFolder, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: deliverablesPropertyFolder, withIntermediateDirectories: true)
 
-        let sessionFolder = nextSessionFolder(in: propertyFolder, datePrefix: metadata.sessionDate)
-        let originalsDestination = sessionFolder.appending(path: "Originals", directoryHint: .isDirectory)
-        let stampedDestination = sessionFolder.appending(path: "Stamped", directoryHint: .isDirectory)
-        let pdfDestination = sessionFolder.appending(path: "PDF", directoryHint: .isDirectory)
+        let sessionFolderName = nextSessionFolderName(
+            in: [archivePropertyFolder, deliverablesPropertyFolder],
+            datePrefix: metadata.sessionDate
+        )
+        let archiveSessionFolder = archivePropertyFolder.appending(path: sessionFolderName, directoryHint: .isDirectory)
+        let deliverablesSessionFolder = deliverablesPropertyFolder.appending(path: sessionFolderName, directoryHint: .isDirectory)
+        let originalsDestination = archiveSessionFolder.appending(path: "Originals", directoryHint: .isDirectory)
+        let stampedDestination = deliverablesSessionFolder.appending(path: "Stamped", directoryHint: .isDirectory)
+        let pdfDestination = deliverablesSessionFolder.appending(path: "PDF", directoryHint: .isDirectory)
 
-        try fileManager.createDirectory(at: sessionFolder, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: archiveSessionFolder, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: deliverablesSessionFolder, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: originalsDestination, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: stampedDestination, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: pdfDestination, withIntermediateDirectories: true)
@@ -750,37 +785,42 @@ final class ScoutProcessController {
 
         let rootContents = try fileManager.contentsOfDirectory(
             at: sourceSessionFolder,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         )
 
         for item in rootContents {
-            let values = try? item.resourceValues(forKeys: [.isRegularFileKey])
-            guard values?.isRegularFile == true else { continue }
+            if item.lastPathComponent == "Originals" || item.lastPathComponent == "Stamped" {
+                continue
+            }
 
-            let destination = sessionFolder.appending(path: item.lastPathComponent)
+            let destination = archiveSessionFolder.appending(path: item.lastPathComponent)
             try moveReplacingIfNeeded(from: item, to: destination)
             log("Moved \(item.path(percentEncoded: false)) -> \(destination.path(percentEncoded: false))")
         }
 
         try? fileManager.removeItem(at: sourceSessionFolder)
-        return sessionFolder
+        return ArchivedSessionDestinations(
+            archiveSessionFolder: archiveSessionFolder,
+            deliverablesSessionFolder: deliverablesSessionFolder
+        )
     }
 
-    private func nextSessionFolder(in propertyFolder: URL, datePrefix: String) -> URL {
-        let existingNames = (try? fileManager.contentsOfDirectory(
-            at: propertyFolder,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ))?.compactMap(\.lastPathComponent) ?? []
+    private func nextSessionFolderName(in propertyFolders: [URL], datePrefix: String) -> String {
+        let existingNames = Set(propertyFolders.flatMap { propertyFolder in
+            (try? fileManager.contentsOfDirectory(
+                at: propertyFolder,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ))?.compactMap(\.lastPathComponent) ?? []
+        })
 
         var sequence = 1
         while true {
             let suffix = String(format: "%02d", sequence)
             let folderName = "\(datePrefix)_\(suffix)"
-            if existingNames.contains(folderName) == false,
-               !fileManager.fileExists(atPath: propertyFolder.appending(path: folderName).path) {
-                return propertyFolder.appending(path: folderName, directoryHint: .isDirectory)
+            if existingNames.contains(folderName) == false {
+                return folderName
             }
             sequence += 1
         }
@@ -800,6 +840,28 @@ final class ScoutProcessController {
     private func sanitizeFolderComponent(_ value: String?, requiredField: String) throws -> String {
         let rawValue = try requiredMetadataValue(value, fieldName: requiredField)
         return sanitizeArchiveComponent(rawValue)
+    }
+
+    private func resolvePropertyStreet(from sessionFolderURL: URL) -> String? {
+        let sessionsCSVURL = sessionFolderURL.appending(path: "sessions.csv")
+        guard let contents = try? String(contentsOf: sessionsCSVURL, encoding: .utf8) else {
+            return nil
+        }
+
+        let rows = parseCSV(contents)
+        guard let firstRow = rows.first else { return nil }
+
+        if let street = firstRow["propertyStreet"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           street.isEmpty == false {
+            return street
+        }
+
+        if let address = firstRow["property_address"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           address.isEmpty == false {
+            return address.components(separatedBy: ",").first?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return nil
     }
 
     private func resolveSessionRoot(in container: URL) throws -> URL {
@@ -1424,6 +1486,24 @@ final class ScoutProcessController {
             }
         }
         return nil
+    }
+
+    private func parseCSV(_ text: String) -> [[String: String]] {
+        let lines = text
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }
+        guard let headerLine = lines.first else { return [] }
+
+        let header = parseCSVLine(headerLine).map(canonicalCSVKey)
+        return lines.dropFirst().map { line in
+            let values = parseCSVLine(line)
+            var row: [String: String] = [:]
+            for (index, key) in header.enumerated() where values.indices.contains(index) {
+                row[key] = values[index]
+            }
+            return row
+        }
     }
 
     private func canonicalCSVKey(_ raw: String) -> String {

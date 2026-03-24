@@ -20,6 +20,7 @@ struct SessionRecord: Codable, FetchableRecord, PersistableRecord {
     var propertyZip: String?
     var primaryContactName: String?
     var primaryContactPhone: String?
+    var primaryContactEmail: String?
     var startedAtUTC: String
     var endedAtUTC: String?
     var isBaseline: Int
@@ -47,6 +48,7 @@ struct SessionRecord: Codable, FetchableRecord, PersistableRecord {
         case propertyZip = "propertyZip"
         case primaryContactName = "primary_contact_name"
         case primaryContactPhone = "primary_contact_phone"
+        case primaryContactEmail = "primary_contact_email"
         case startedAtUTC = "started_at_utc"
         case endedAtUTC = "ended_at_utc"
         case isBaseline = "is_baseline"

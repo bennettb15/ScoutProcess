@@ -35,7 +35,6 @@ struct PunchListView: View {
     @State private var relatedShotPreviews: [String: NSImage] = [:]
     @State private var isUploadingResolution = false
     @State private var uploadMessage: String?
-    @State private var showingGallery = false
     @State private var galleryStartIndex = 0
     @State private var showingClearDevDataAlert = false
     @State private var isClearingDevData = false
@@ -94,13 +93,6 @@ struct PunchListView: View {
         .onChange(of: pastDueOnly) { _, _ in applyCurrentFilters() }
         .onChange(of: selectedPunchListPage) { _, _ in applyCurrentFilters() }
         .onChange(of: selectedItemID) { _, _ in syncDraftsFromSelection() }
-        .sheet(isPresented: $showingGallery) {
-            ShotGallerySheet(
-                shots: relatedShots,
-                previews: relatedShotPreviews,
-                initialIndex: galleryStartIndex
-            )
-        }
         .sheet(item: $resolutionPromptItem) { item in
             ResolutionNotePromptSheet(
                 title: identityLine(for: item),
@@ -557,13 +549,13 @@ struct PunchListView: View {
                     HStack(spacing: 10) {
                         Button("Review Past Shots (\(max(relatedShots.count - 1, 0)))") {
                             galleryStartIndex = 1
-                            showingGallery = true
+                            presentGallery(startIndex: 1)
                         }
                         .disabled(relatedShots.count < 2)
 
                         Button("Open Full Gallery") {
                             galleryStartIndex = 0
-                            showingGallery = true
+                            presentGallery(startIndex: 0)
                         }
                         .disabled(relatedShots.isEmpty)
                     }
@@ -708,9 +700,9 @@ struct PunchListView: View {
 
             var previews: [String: NSImage] = [:]
             for shot in loaded {
-                guard let filename = shot.stampedJpegFilename,
-                      let imageURL = PunchListService.shared.resolveArchivedImageURL(
-                        filename: filename,
+                guard let imageURL = PunchListService.shared.resolveArchivedImageURL(
+                        preferredOriginalFilename: shot.originalFilename,
+                        preferredStampedFilename: shot.stampedJpegFilename,
                         preferredSessionID: shot.sessionID,
                         preferredPropertyID: shot.propertyID,
                         preferredLogicalShotIdentity: shot.logicalShotIdentity,
@@ -826,6 +818,7 @@ struct PunchListView: View {
                 shotKey: existing.shotKey,
                 capturedAtUTC: existing.capturedAtUTC,
                 flaggedReason: existing.flaggedReason,
+                originalFilename: existing.originalFilename,
                 stampedJpegFilename: existing.stampedJpegFilename,
                 status: existing.status,
                 priority: priority,
@@ -883,6 +876,7 @@ struct PunchListView: View {
                 shotKey: existing.shotKey,
                 capturedAtUTC: existing.capturedAtUTC,
                 flaggedReason: existing.flaggedReason,
+                originalFilename: existing.originalFilename,
                 stampedJpegFilename: existing.stampedJpegFilename,
                 status: existing.status,
                 priority: existing.priority,
@@ -962,6 +956,7 @@ struct PunchListView: View {
                 shotKey: existing.shotKey,
                 capturedAtUTC: existing.capturedAtUTC,
                 flaggedReason: existing.flaggedReason,
+                originalFilename: existing.originalFilename,
                 stampedJpegFilename: existing.stampedJpegFilename,
                 status: status,
                 priority: existing.priority,
@@ -1019,6 +1014,7 @@ struct PunchListView: View {
                 shotKey: existing.shotKey,
                 capturedAtUTC: existing.capturedAtUTC,
                 flaggedReason: existing.flaggedReason,
+                originalFilename: existing.originalFilename,
                 stampedJpegFilename: existing.stampedJpegFilename,
                 status: existing.status,
                 priority: existing.priority,
@@ -1076,6 +1072,7 @@ struct PunchListView: View {
                 shotKey: existing.shotKey,
                 capturedAtUTC: existing.capturedAtUTC,
                 flaggedReason: existing.flaggedReason,
+                originalFilename: existing.originalFilename,
                 stampedJpegFilename: existing.stampedJpegFilename,
                 status: existing.status,
                 priority: existing.priority,
@@ -1352,6 +1349,7 @@ struct PunchListView: View {
                 shotKey: existing.shotKey,
                 capturedAtUTC: existing.capturedAtUTC,
                 flaggedReason: existing.flaggedReason,
+                originalFilename: existing.originalFilename,
                 stampedJpegFilename: existing.stampedJpegFilename,
                 status: existing.status,
                 priority: existing.priority,
@@ -1395,6 +1393,7 @@ struct PunchListView: View {
                 shotKey: existing.shotKey,
                 capturedAtUTC: existing.capturedAtUTC,
                 flaggedReason: existing.flaggedReason,
+                originalFilename: existing.originalFilename,
                 stampedJpegFilename: existing.stampedJpegFilename,
                 status: existing.status,
                 priority: existing.priority,
@@ -1438,6 +1437,7 @@ struct PunchListView: View {
                 shotKey: existing.shotKey,
                 capturedAtUTC: existing.capturedAtUTC,
                 flaggedReason: existing.flaggedReason,
+                originalFilename: existing.originalFilename,
                 stampedJpegFilename: existing.stampedJpegFilename,
                 status: existing.status,
                 priority: existing.priority,
@@ -2063,6 +2063,10 @@ struct PunchListView: View {
     }
 
     private func displayPhotoName(for item: PunchListItemSummary) -> String {
+        if let original = item.originalFilename?.trimmingCharacters(in: .whitespacesAndNewlines),
+           original.isEmpty == false {
+            return original
+        }
         if let stamped = item.stampedJpegFilename?.trimmingCharacters(in: .whitespacesAndNewlines),
            stamped.isEmpty == false {
             return stamped
@@ -2107,10 +2111,9 @@ struct PunchListView: View {
     }
 
     private static func loadRowThumbnail(for item: PunchListItemSummary) -> NSImage? {
-        guard let filename = item.stampedJpegFilename?.trimmingCharacters(in: .whitespacesAndNewlines),
-              filename.isEmpty == false,
-              let imageURL = PunchListService.shared.resolveArchivedImageURL(
-                filename: filename,
+        guard let imageURL = PunchListService.shared.resolveArchivedImageURL(
+                preferredOriginalFilename: item.originalFilename,
+                preferredStampedFilename: item.stampedJpegFilename,
                 preferredSessionID: item.sessionID,
                 preferredPropertyID: item.propertyID,
                 preferredLogicalShotIdentity: item.logicalShotIdentity,
@@ -2141,9 +2144,21 @@ struct PunchListView: View {
         Task {
             selectedItemID = item.id
             await loadRelatedShots(for: item)
-            galleryStartIndex = 0
-            showingGallery = true
+            await MainActor.run {
+                galleryStartIndex = 0
+                presentGallery(startIndex: 0)
+            }
         }
+    }
+
+    private func presentGallery(startIndex: Int) {
+        guard relatedShots.isEmpty == false else { return }
+        galleryStartIndex = startIndex
+        PunchListGalleryWindowController.shared.present(
+            shots: relatedShots,
+            previews: relatedShotPreviews,
+            initialIndex: startIndex
+        )
     }
 
     private func formattedDueDateInput(_ input: String) -> String {
@@ -2215,7 +2230,7 @@ struct PunchListView: View {
             if let latestShot = relatedShots.first, let image = relatedShotPreviews[latestShot.id] {
                 Button {
                     galleryStartIndex = 0
-                    showingGallery = true
+                    presentGallery(startIndex: 0)
                 } label: {
                     ZStack {
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -2289,19 +2304,14 @@ private struct ShotGallerySheet: View {
     let shots: [PunchListRelatedShot]
     let previews: [String: NSImage]
     let initialIndex: Int
-
-    @Environment(\.dismiss) private var dismiss
+    let onClose: () -> Void
+    let onWindowTitleChange: (String) -> Void
     @State private var selection: Int = 0
+    @State private var zoomScale: CGFloat = 1.0
+    @State private var showsThumbnails = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Shot Gallery")
-                    .font(.title3.weight(.semibold))
-                Spacer()
-                Button("Done") { dismiss() }
-            }
-
+        VStack(alignment: .leading, spacing: 0) {
             if shots.isEmpty {
                 Spacer()
                 Text("No shots available")
@@ -2309,85 +2319,562 @@ private struct ShotGallerySheet: View {
                 Spacer()
             } else {
                 let selectedShot = shots[min(max(selection, 0), shots.count - 1)]
-                VStack(alignment: .leading, spacing: 10) {
-                    if let image = previews[selectedShot.id] {
-                        Image(nsImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(maxHeight: 460)
-                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    } else {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color.secondary.opacity(0.12))
-                            .overlay {
-                                Text("No preview available")
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(height: 320)
-                    }
-
-                    HStack(spacing: 10) {
-                        Text(selectedShot.sessionID)
-                        Text(selectedShot.capturedAtUTC ?? "Unknown capture")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                    HStack(spacing: 6) {
-                        Image(systemName: "flag.fill")
-                            .foregroundStyle(.red)
-                        Text(
-                            selectedShot.flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                            ? selectedShot.flaggedReason!
-                            : "Flagged"
-                        )
-                    }
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white)
-
-                    ScrollView(.horizontal) {
-                        HStack(spacing: 10) {
-                            ForEach(Array(shots.enumerated()), id: \.offset) { index, shot in
-                                Button {
-                                    selection = index
-                                } label: {
-                                    ZStack {
-                                        if let thumb = previews[shot.id] {
-                                            Image(nsImage: thumb)
-                                                .resizable()
-                                                .scaledToFill()
-                                                .frame(width: 130, height: 84)
-                                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                        } else {
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .fill(Color.secondary.opacity(0.12))
-                                                .overlay {
-                                                    Text("No Preview")
-                                                        .font(.caption2)
-                                                        .foregroundStyle(.secondary)
-                                                }
-                                                .frame(width: 130, height: 84)
-                                        }
+                VStack(alignment: .leading, spacing: 0) {
+                    ZStack(alignment: .bottom) {
+                        Group {
+                            if let image = previews[selectedShot.id] {
+                                InteractiveGalleryImageView(image: image, zoomScale: zoomScale)
+                            } else {
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(Color.secondary.opacity(0.12))
+                                    .overlay {
+                                        Text("No preview available")
+                                            .foregroundStyle(.secondary)
                                     }
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .stroke(selection == index ? Color.accentColor : Color.clear, lineWidth: 2)
-                                    )
-                                }
-                                .buttonStyle(.plain)
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                             }
                         }
-                        .padding(.vertical, 2)
+
+                        if showsThumbnails {
+                            thumbnailOverlay
+                                .padding(.horizontal, 12)
+                                .padding(.bottom, 12)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
-        .padding(14)
-        .frame(minWidth: 760, minHeight: 620)
+        .frame(minWidth: 420, minHeight: 320)
         .onAppear {
             let bounded = min(max(initialIndex, 0), max(shots.count - 1, 0))
             selection = bounded
+            zoomScale = 1.0
+            if let currentShot {
+                onWindowTitleChange(windowTitle(for: currentShot))
+            }
         }
+        .onChange(of: selection) { _, _ in
+            if let currentShot {
+                onWindowTitleChange(windowTitle(for: currentShot))
+            }
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .automatic) {
+                if currentImage != nil {
+                    ControlGroup {
+                        Button {
+                            zoomScale = max(1.0, zoomScale / 1.25)
+                        } label: {
+                            Image(systemName: "minus.magnifyingglass")
+                        }
+                        .disabled(zoomScale <= 1.0)
+                        .help("Zoom Out")
+
+                        Button {
+                            zoomScale = 1.0
+                        } label: {
+                            Text("\(Int((zoomScale * 100).rounded()))%")
+                                .font(.caption.monospacedDigit())
+                        }
+                        .help("Fit To Window")
+
+                        Button {
+                            zoomScale = min(4.0, zoomScale * 1.25)
+                        } label: {
+                            Image(systemName: "plus.magnifyingglass")
+                        }
+                        .disabled(zoomScale >= 4.0)
+                        .help("Zoom In")
+                    }
+                }
+
+                Button {
+                    showsThumbnails.toggle()
+                } label: {
+                    Image(systemName: "square.stack.3d.down.forward")
+                }
+                .help(showsThumbnails ? "Hide Thumbnails" : "Show Thumbnails")
+
+                if let selectedShot = currentShot, let selectedURL = fileURL(for: selectedShot) {
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting([selectedURL])
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .help("Locate File")
+                }
+            }
+        }
+    }
+
+    private var currentShot: PunchListRelatedShot? {
+        guard shots.isEmpty == false else { return nil }
+        return shots[min(max(selection, 0), shots.count - 1)]
+    }
+
+    private var currentImage: NSImage? {
+        guard let currentShot else { return nil }
+        return previews[currentShot.id]
+    }
+
+    private var thumbnailOverlay: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(Array(shots.enumerated()), id: \.offset) { index, shot in
+                    Button {
+                        selection = index
+                        zoomScale = 1.0
+                    } label: {
+                        ZStack {
+                            if let thumb = previews[shot.id] {
+                                Image(nsImage: thumb)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 130, height: 84)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            } else {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(Color.secondary.opacity(0.12))
+                                    .overlay {
+                                        Text("No Preview")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .frame(width: 130, height: 84)
+                            }
+                        }
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(selection == index ? Color.accentColor : Color.clear, lineWidth: 2)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func fileURL(for shot: PunchListRelatedShot) -> URL? {
+        PunchListService.shared.resolveArchivedImageURL(
+            preferredOriginalFilename: shot.originalFilename,
+            preferredStampedFilename: shot.stampedJpegFilename,
+            preferredSessionID: shot.sessionID,
+            preferredPropertyID: shot.propertyID,
+            preferredLogicalShotIdentity: shot.logicalShotIdentity,
+            preferredShotKey: shot.shotKey,
+            preferredCapturedAtUTC: shot.capturedAtUTC
+        )
+    }
+
+    private func shotIdentityLine(for shot: PunchListRelatedShot) -> String {
+        if let normalizedKey = normalizedShotIdentity(from: shot.shotKey),
+           normalizedKey.isEmpty == false {
+            return normalizedKey
+        }
+        if let normalizedLogical = normalizedShotIdentity(from: shot.logicalShotIdentity),
+           normalizedLogical.isEmpty == false {
+            return normalizedLogical
+        }
+        if let original = shot.originalFilename?.trimmingCharacters(in: .whitespacesAndNewlines),
+           original.isEmpty == false {
+            return original
+        }
+        return shot.sessionID
+    }
+
+    private func windowTitle(for shot: PunchListRelatedShot) -> String {
+        let identity = shotIdentityLine(for: shot)
+        let reason = shot.flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let reason, reason.isEmpty == false {
+            return "\(identity) 🚩 \(reason)"
+        }
+        return "\(identity) 🚩"
+    }
+
+    private func normalizedShotIdentity(from raw: String?) -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              raw.isEmpty == false else {
+            return nil
+        }
+
+        let pieces = raw
+            .split(separator: "|")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { piece in
+                piece.isEmpty == false
+                    && piece.caseInsensitiveCompare("flagged") != .orderedSame
+                    && isUUIDLike(piece) == false
+            }
+
+        guard pieces.isEmpty == false else { return nil }
+
+        let tail = Array(pieces.suffix(min(4, pieces.count)))
+        return tail.enumerated().map { index, piece in
+            if index == tail.count - 1 {
+                return normalizedAngle(piece)
+            }
+            return normalizedTitleCase(piece)
+        }.joined(separator: " | ")
+    }
+
+    private func normalizedAngle(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "A0" }
+        if trimmed.uppercased().hasPrefix("A") { return trimmed.uppercased() }
+        return "A\(trimmed)"
+    }
+
+    private func normalizedTitleCase(_ raw: String) -> String {
+        raw
+            .lowercased()
+            .split(separator: "/")
+            .map { segment in
+                segment
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .split(separator: " ")
+                    .map { token in
+                        token.prefix(1).uppercased() + token.dropFirst().lowercased()
+                    }
+                    .joined(separator: " ")
+            }
+            .joined(separator: " / ")
+    }
+
+    private func isUUIDLike(_ raw: String) -> Bool {
+        raw.range(
+            of: #"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private func formattedCaptureDate(_ rawUTC: String?) -> String? {
+        guard let rawUTC else { return nil }
+        guard let date = Self.iso8601Formatter.date(from: rawUTC)
+                ?? Self.iso8601Fallback.date(from: rawUTC) else {
+            return rawUTC
+        }
+        return Self.displayFormatter.string(from: date)
+    }
+
+    private static let iso8601Formatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let iso8601Fallback: ISO8601DateFormatter = {
+        ISO8601DateFormatter()
+    }()
+
+    private static let displayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "America/New_York") ?? .current
+        formatter.dateFormat = "MM/dd/yyyy h:mm a"
+        return formatter
+    }()
+
+}
+
+private struct InteractiveGalleryImageView: NSViewRepresentable {
+    let image: NSImage
+    let zoomScale: CGFloat
+
+    func makeNSView(context: Context) -> InteractiveGalleryImageContainerView {
+        let view = InteractiveGalleryImageContainerView()
+        view.update(image: image, zoomScale: zoomScale)
+        return view
+    }
+
+    func updateNSView(_ nsView: InteractiveGalleryImageContainerView, context: Context) {
+        nsView.update(image: image, zoomScale: zoomScale)
+    }
+}
+
+private final class InteractiveGalleryImageContainerView: NSView {
+    private let scrollView = PannableGalleryScrollView()
+    private let documentView = NSView()
+    private let imageView = NSImageView()
+    private var currentImage: NSImage?
+    private var currentZoomScale: CGFloat = 1.0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        wantsLayer = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = false
+        scrollView.verticalScrollElasticity = .none
+        scrollView.horizontalScrollElasticity = .none
+        scrollView.documentView = documentView
+
+        imageView.imageScaling = .scaleAxesIndependently
+        documentView.addSubview(imageView)
+        addSubview(scrollView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        scrollView.frame = bounds
+        layoutImage()
+    }
+
+    func update(image: NSImage, zoomScale: CGFloat) {
+        currentImage = image
+        currentZoomScale = max(1.0, min(zoomScale, 4.0))
+        imageView.image = image
+        needsLayout = true
+    }
+
+    private func layoutImage() {
+        guard let image = currentImage else { return }
+
+        let viewportSize = scrollView.contentSize
+        guard viewportSize.width > 0, viewportSize.height > 0 else { return }
+
+        let imageSize = image.size
+        guard imageSize.width > 0, imageSize.height > 0 else { return }
+
+        let fitScale = min(viewportSize.width / imageSize.width, viewportSize.height / imageSize.height)
+        let appliedScale = fitScale * currentZoomScale
+        let displayedWidth = imageSize.width * appliedScale
+        let displayedHeight = imageSize.height * appliedScale
+
+        let documentWidth = max(displayedWidth, viewportSize.width)
+        let documentHeight = max(displayedHeight, viewportSize.height)
+
+        documentView.frame = NSRect(x: 0, y: 0, width: documentWidth, height: documentHeight)
+        imageView.frame = NSRect(
+            x: (documentWidth - displayedWidth) / 2,
+            y: (documentHeight - displayedHeight) / 2,
+            width: displayedWidth,
+            height: displayedHeight
+        )
+
+        let isPannable = displayedWidth > viewportSize.width + 1 || displayedHeight > viewportSize.height + 1
+        scrollView.isPannable = isPannable
+        scrollView.hasVerticalScroller = isPannable
+        scrollView.hasHorizontalScroller = isPannable
+    }
+}
+
+private final class PannableGalleryScrollView: NSScrollView {
+    var isPannable = false {
+        didSet {
+            discardCursorRects()
+        }
+    }
+
+    private var dragStartLocation: NSPoint?
+    private var dragStartOrigin: NSPoint = .zero
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isPannable {
+            addCursorRect(bounds, cursor: .openHand)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isPannable else {
+            super.mouseDown(with: event)
+            return
+        }
+        dragStartLocation = convert(event.locationInWindow, from: nil)
+        dragStartOrigin = contentView.bounds.origin
+        NSCursor.closedHand.push()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isPannable, let dragStartLocation else {
+            super.mouseDragged(with: event)
+            return
+        }
+
+        let currentLocation = convert(event.locationInWindow, from: nil)
+        let deltaX = currentLocation.x - dragStartLocation.x
+        let deltaY = currentLocation.y - dragStartLocation.y
+
+        let maxX = max((documentView?.frame.width ?? 0) - contentView.bounds.width, 0)
+        let maxY = max((documentView?.frame.height ?? 0) - contentView.bounds.height, 0)
+
+        let targetOrigin = NSPoint(
+            x: min(max(dragStartOrigin.x - deltaX, 0), maxX),
+            y: min(max(dragStartOrigin.y + deltaY, 0), maxY)
+        )
+        contentView.scroll(to: targetOrigin)
+        reflectScrolledClipView(contentView)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if isPannable {
+            NSCursor.pop()
+            dragStartLocation = nil
+            return
+        }
+        super.mouseUp(with: event)
+    }
+}
+
+private final class PunchListGalleryWindowController: NSObject, NSWindowDelegate {
+    static let shared = PunchListGalleryWindowController()
+
+    private var window: NSWindow?
+
+    func present(shots: [PunchListRelatedShot], previews: [String: NSImage], initialIndex: Int) {
+        let content = ShotGallerySheet(
+            shots: shots,
+            previews: previews,
+            initialIndex: initialIndex,
+            onClose: { [weak self] in
+                self?.window?.performClose(nil)
+            },
+            onWindowTitleChange: { [weak self] title in
+                self?.window?.title = title
+            }
+        )
+
+        let hostingController = NSHostingController(rootView: content)
+
+        if let window {
+            window.contentViewController = hostingController
+            let sizing = Self.defaultWindowSizing(for: shots, previews: previews, initialIndex: initialIndex)
+            window.minSize = sizing.minSize
+            window.setContentSize(sizing.defaultSize)
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let newWindow = NSWindow(contentViewController: hostingController)
+        newWindow.title = "Shot Gallery"
+        let sizing = Self.defaultWindowSizing(for: shots, previews: previews, initialIndex: initialIndex)
+        newWindow.setContentSize(sizing.defaultSize)
+        newWindow.minSize = sizing.minSize
+        newWindow.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        newWindow.titleVisibility = .visible
+        newWindow.titlebarAppearsTransparent = false
+        newWindow.toolbarStyle = .unifiedCompact
+        newWindow.isReleasedWhenClosed = false
+        newWindow.center()
+        newWindow.delegate = self
+        newWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        window = newWindow
+        if let selectedShot = selectedShot(for: shots, initialIndex: initialIndex) {
+            newWindow.title = galleryWindowTitle(for: selectedShot)
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if let closingWindow = notification.object as? NSWindow, closingWindow === window {
+            window = nil
+        }
+    }
+
+    private static func defaultWindowSizing(
+        for shots: [PunchListRelatedShot],
+        previews: [String: NSImage],
+        initialIndex: Int
+    ) -> (defaultSize: NSSize, minSize: NSSize) {
+        let boundedIndex = min(max(initialIndex, 0), max(shots.count - 1, 0))
+        let selectedShot = shots.isEmpty ? nil : shots[boundedIndex]
+        let imageSize = selectedShot.flatMap { previews[$0.id]?.size } ?? NSSize(width: 1200, height: 900)
+
+        let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 960)
+        let maxWidth = max(visibleFrame.width - 20, 420)
+        let maxHeight = max(visibleFrame.height - 20, 180)
+        let chromeWidth: CGFloat = 2
+        let chromeHeight: CGFloat = 30
+        let maxImageWidth = max(maxWidth - chromeWidth, 320)
+        let maxImageHeight = max(maxHeight - chromeHeight, 140)
+        let widthScale = maxImageWidth / max(imageSize.width, 1)
+        let heightScale = maxImageHeight / max(imageSize.height, 1)
+        let scale = min(widthScale, heightScale, 1.0)
+        let fittedImageWidth = imageSize.width * scale
+        let fittedImageHeight = imageSize.height * scale
+
+        let defaultWidth = min(max(fittedImageWidth + chromeWidth, 420), maxWidth)
+        let defaultHeight = min(max(fittedImageHeight + chromeHeight, 150), maxHeight)
+        let minWidth = min(max(defaultWidth * 0.72, 360), defaultWidth)
+
+        return (
+            defaultSize: NSSize(width: defaultWidth, height: defaultHeight),
+            minSize: NSSize(width: minWidth, height: 150)
+        )
+    }
+
+    private func selectedShot(for shots: [PunchListRelatedShot], initialIndex: Int) -> PunchListRelatedShot? {
+        guard shots.isEmpty == false else { return nil }
+        let boundedIndex = min(max(initialIndex, 0), shots.count - 1)
+        return shots[boundedIndex]
+    }
+
+    private func galleryWindowTitle(for shot: PunchListRelatedShot) -> String {
+        let identity = normalizedGalleryShotIdentity(from: shot) ?? shot.sessionID
+        let reason = shot.flaggedReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let reason, reason.isEmpty == false {
+            return "\(identity) 🚩 \(reason)"
+        }
+        return "\(identity) 🚩"
+    }
+
+    private func normalizedGalleryShotIdentity(from shot: PunchListRelatedShot) -> String? {
+        let candidates = [shot.shotKey, shot.logicalShotIdentity]
+        for raw in candidates {
+            guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), raw.isEmpty == false else { continue }
+            let pieces = raw
+                .split(separator: "|")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter {
+                    $0.isEmpty == false
+                    && $0.caseInsensitiveCompare("flagged") != .orderedSame
+                    && $0.range(
+                        of: #"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"#,
+                        options: .regularExpression
+                    ) == nil
+                }
+            guard pieces.isEmpty == false else { continue }
+            let tail = Array(pieces.suffix(min(4, pieces.count)))
+            return tail.enumerated().map { index, piece in
+                if index == tail.count - 1 {
+                    let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return trimmed.uppercased().hasPrefix("A") ? trimmed.uppercased() : "A\(trimmed)"
+                }
+                return piece
+                    .lowercased()
+                    .split(separator: "/")
+                    .map { segment in
+                        segment
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .split(separator: " ")
+                            .map { token in
+                                token.prefix(1).uppercased() + token.dropFirst().lowercased()
+                            }
+                            .joined(separator: " ")
+                    }
+                    .joined(separator: " / ")
+            }.joined(separator: " | ")
+        }
+        return nil
     }
 }
 

@@ -75,6 +75,7 @@ final class DatabaseManager {
                     propertyZip TEXT,
                     primary_contact_name TEXT,
                     primary_contact_phone TEXT,
+                    primary_contact_email TEXT,
                     started_at_utc TEXT NOT NULL,
                     ended_at_utc TEXT,
                     is_baseline INTEGER NOT NULL DEFAULT 0,
@@ -453,6 +454,13 @@ final class DatabaseManager {
             let shotColumnNames = try Set(db.columns(in: "shots").map(\.name))
             if shotColumnNames.contains("capture_profile") == false {
                 try db.execute(sql: "ALTER TABLE shots ADD COLUMN capture_profile TEXT")
+            }
+        }
+
+        migrator.registerMigration("addPrimaryContactEmailToSessionsV1") { db in
+            let sessionColumnNames = try Set(db.columns(in: "sessions").map(\.name))
+            if sessionColumnNames.contains("primary_contact_email") == false {
+                try db.execute(sql: "ALTER TABLE sessions ADD COLUMN primary_contact_email TEXT")
             }
         }
 
