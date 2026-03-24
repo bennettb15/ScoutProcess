@@ -369,6 +369,7 @@ final class CSVImportService {
                     propertyZip,
                     primary_contact_name,
                     primary_contact_phone,
+                    primary_contact_email,
                     started_at_utc,
                     ended_at_utc,
                     is_baseline,
@@ -379,7 +380,7 @@ final class CSVImportService {
                     capture_profile,
                     imported_at,
                     zip_name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     property_id = excluded.property_id,
                     org_id = excluded.org_id,
@@ -393,6 +394,7 @@ final class CSVImportService {
                     propertyZip = excluded.propertyZip,
                     primary_contact_name = excluded.primary_contact_name,
                     primary_contact_phone = excluded.primary_contact_phone,
+                    primary_contact_email = excluded.primary_contact_email,
                     started_at_utc = excluded.started_at_utc,
                     ended_at_utc = excluded.ended_at_utc,
                     is_baseline = excluded.is_baseline,
@@ -418,6 +420,7 @@ final class CSVImportService {
                     optionalValue(for: "propertyZip", in: row, aliases: Self.sessionAliases),
                     optionalValue(for: "primary_contact_name", in: row, aliases: Self.sessionAliases),
                     optionalValue(for: "primary_contact_phone", in: row, aliases: Self.sessionAliases),
+                    optionalValue(for: "primary_contact_email", in: row, aliases: Self.sessionAliases),
                     startedAtUTC,
                     optionalValue(for: "ended_at_utc", in: row, aliases: Self.sessionAliases),
                     boolIntegerValue(for: "is_baseline", in: row, aliases: Self.sessionAliases, defaultValue: 0),
@@ -1148,6 +1151,7 @@ final class CSVImportService {
         "propertyZip": ["propertyZip", "property_zip"],
         "primary_contact_name": ["primary_contact_name", "primarycontactname"],
         "primary_contact_phone": ["primary_contact_phone", "primarycontactphone"],
+        "primary_contact_email": ["primary_contact_email", "primarycontactemail", "email"],
         "started_at_utc": ["started_at_utc", "startedatutc", "created_at", "createdat", "started_at"],
         "ended_at_utc": ["ended_at_utc", "endedatutc"],
         "is_baseline": ["is_baseline", "isbaseline"],

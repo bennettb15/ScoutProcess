@@ -94,6 +94,7 @@ struct PunchListItemSummary: FetchableRecord, Decodable, Identifiable {
     let shotKey: String?
     let capturedAtUTC: String?
     let flaggedReason: String?
+    let originalFilename: String?
     let stampedJpegFilename: String?
     let status: String
     let priority: String
@@ -120,6 +121,7 @@ struct PunchListItemSummary: FetchableRecord, Decodable, Identifiable {
         case shotKey = "shot_key"
         case capturedAtUTC = "captured_at_utc"
         case flaggedReason = "flagged_reason"
+        case originalFilename = "original_filename"
         case stampedJpegFilename = "stamped_jpeg_filename"
         case status
         case priority
@@ -140,6 +142,7 @@ struct PunchListRelatedShot: FetchableRecord, Decodable, Identifiable {
     let shotKey: String?
     let logicalShotIdentity: String?
     let capturedAtUTC: String?
+    let originalFilename: String?
     let stampedJpegFilename: String?
     let isFlagged: Int
     let flaggedReason: String?
@@ -156,6 +159,7 @@ struct PunchListRelatedShot: FetchableRecord, Decodable, Identifiable {
         case shotKey = "shot_key"
         case logicalShotIdentity = "logical_shot_identity"
         case capturedAtUTC = "captured_at_utc"
+        case originalFilename = "original_filename"
         case stampedJpegFilename = "stamped_jpeg_filename"
         case isFlagged = "is_flagged"
         case flaggedReason = "flagged_reason"
@@ -168,6 +172,7 @@ struct PunchListItemLocator: FetchableRecord, Decodable {
     let sessionID: String
     let issueID: String?
     let logicalShotIdentity: String
+    let originalFilename: String?
     let stampedJpegFilename: String?
     let propertyID: String?
 
@@ -175,6 +180,7 @@ struct PunchListItemLocator: FetchableRecord, Decodable {
         case sessionID = "session_id"
         case issueID = "issue_id"
         case logicalShotIdentity = "logical_shot_identity"
+        case originalFilename = "original_filename"
         case stampedJpegFilename = "stamped_jpeg_filename"
         case propertyID = "property_id"
     }
@@ -415,6 +421,7 @@ final class PunchListService {
                 WITH grouped AS (
                     SELECT
                         pli.*,
+                        s.original_filename,
                         COALESCE(pli.property_id, '') || '|' ||
                         LOWER(TRIM(COALESCE(pli.building, ''))) || '|' ||
                         LOWER(TRIM(COALESCE(pli.elevation, ''))) || '|' ||
@@ -438,6 +445,9 @@ final class PunchListService {
                             ORDER BY COALESCE(pli.captured_at_utc, '') DESC, pli.updated_at_utc DESC, pli.id DESC
                         ) AS row_rank
                     FROM punch_list_items pli
+                    LEFT JOIN shots s
+                        ON s.session_id = pli.session_id
+                       AND COALESCE(s.shot_id, '') = COALESCE(pli.shot_id, '')
                     \(whereClause)
                 )
                 SELECT
@@ -456,6 +466,7 @@ final class PunchListService {
                     shot_key,
                     captured_at_utc,
                     flagged_reason,
+                    original_filename,
                     stamped_jpeg_filename,
                     status,
                     priority,
@@ -514,6 +525,7 @@ final class PunchListService {
                     s.shot_key,
                     s.logical_shot_identity,
                     s.captured_at_utc,
+                    s.original_filename,
                     s.stamped_jpeg_filename,
                     s.is_flagged,
                     COALESCE(
@@ -644,8 +656,17 @@ final class PunchListService {
             guard let locator = try PunchListItemLocator.fetchOne(
                 db,
                 sql: """
-                SELECT session_id, issue_id, logical_shot_identity, stamped_jpeg_filename, property_id
-                FROM punch_list_items
+                SELECT
+                    pli.session_id,
+                    pli.issue_id,
+                    pli.logical_shot_identity,
+                    s.original_filename,
+                    pli.stamped_jpeg_filename,
+                    pli.property_id
+                FROM punch_list_items pli
+                LEFT JOIN shots s
+                    ON s.session_id = pli.session_id
+                   AND COALESCE(s.shot_id, '') = COALESCE(pli.shot_id, '')
                 WHERE id = ?
                 """,
                 arguments: [itemID]
@@ -783,19 +804,21 @@ final class PunchListService {
     }
 
     func resolveArchivedImageURL(
-        filename: String,
+        preferredOriginalFilename: String? = nil,
+        preferredStampedFilename: String? = nil,
         preferredSessionID: String? = nil,
         preferredPropertyID: String? = nil,
         preferredLogicalShotIdentity: String? = nil,
         preferredShotKey: String? = nil,
         preferredCapturedAtUTC: String? = nil
     ) -> URL? {
-        let normalizedName = filename.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard normalizedName.isEmpty == false else { return nil }
+        let originalName = preferredOriginalFilename?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stampedName = preferredStampedFilename?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedOriginal = (originalName?.isEmpty == false) ? originalName! : nil
+        let normalizedStamped = (stampedName?.isEmpty == false) ? stampedName! : nil
+        guard normalizedOriginal != nil || normalizedStamped != nil else { return nil }
 
-        let clientsRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents", isDirectory: true)
-            .appendingPathComponent("ScoutArchive", isDirectory: true)
+        let clientsRoot = ScoutProcessLocationSettings.archiveRootURL()
             .appendingPathComponent("Clients", isDirectory: true)
 
         guard let enumerator = FileManager.default.enumerator(
@@ -808,7 +831,10 @@ final class PunchListService {
 
         var matchedCandidates: [URL] = []
         for case let candidate as URL in enumerator {
-            guard candidate.lastPathComponent.caseInsensitiveCompare(normalizedName) == .orderedSame else { continue }
+            let fileName = candidate.lastPathComponent
+            let matchesOriginal = normalizedOriginal.map { fileName.caseInsensitiveCompare($0) == .orderedSame } ?? false
+            let matchesStamped = normalizedStamped.map { fileName.caseInsensitiveCompare($0) == .orderedSame } ?? false
+            guard matchesOriginal || matchesStamped else { continue }
             guard (try? candidate.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
             matchedCandidates.append(candidate)
         }
@@ -825,6 +851,18 @@ final class PunchListService {
         let scored = matchedCandidates.map { candidate -> (url: URL, score: Int, modified: Date) in
             let path = candidate.path(percentEncoded: false).lowercased()
             var score = 0
+            if let normalizedOriginal, candidate.lastPathComponent.caseInsensitiveCompare(normalizedOriginal) == .orderedSame {
+                score += 300
+                if path.contains("/originals/") {
+                    score += 120
+                }
+            }
+            if let normalizedStamped, candidate.lastPathComponent.caseInsensitiveCompare(normalizedStamped) == .orderedSame {
+                score += 180
+                if path.contains("/stamped/") {
+                    score += 60
+                }
+            }
             if sessionToken.isEmpty == false && path.contains(sessionToken) {
                 score += 100
             }
@@ -901,15 +939,15 @@ final class PunchListService {
         let fileManager = FileManager.default
 
         let destinationDirectory: URL
-        if let stampedFilename = locator.stampedJpegFilename,
-           let stampedURL = PunchListService.shared.resolveArchivedImageURL(filename: stampedFilename) {
-            destinationDirectory = stampedURL
+        if let imageURL = PunchListService.shared.resolveArchivedImageURL(
+            preferredOriginalFilename: locator.originalFilename,
+            preferredStampedFilename: locator.stampedJpegFilename
+        ) {
+            destinationDirectory = imageURL
                 .deletingLastPathComponent()
                 .appendingPathComponent("Resolved", isDirectory: true)
         } else {
-            destinationDirectory = fileManager.homeDirectoryForCurrentUser
-                .appendingPathComponent("Documents", isDirectory: true)
-                .appendingPathComponent("ScoutArchive", isDirectory: true)
+            destinationDirectory = ScoutProcessLocationSettings.archiveRootURL(fileManager: fileManager)
                 .appendingPathComponent("PunchListResolutions", isDirectory: true)
                 .appendingPathComponent(locator.sessionID, isDirectory: true)
         }

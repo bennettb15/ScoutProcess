@@ -12,6 +12,20 @@ struct ContentView: View {
     @Environment(ScoutProcessModel.self) private var model
     @Environment(\.colorScheme) private var colorScheme
     @State private var selectedTab: DashboardTab = .pipeline
+    @State private var isLogVisible = false
+    @State private var regenStampedImagery = true
+    @State private var regenPropertyReport = true
+    @State private var regenFlaggedItems = false
+    @State private var regenPriorityItems = false
+
+    private var canRunRegeneration: Bool {
+        model.selectedRegenSessionFolderURL != nil && (
+            regenStampedImagery ||
+            regenPropertyReport ||
+            regenFlaggedItems ||
+            regenPriorityItems
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -20,6 +34,8 @@ struct ContentView: View {
             if selectedTab == .pipeline {
                 queueSection
                 logSection
+            } else if selectedTab == .regen {
+                regenSection
             } else {
                 PunchListView()
             }
@@ -31,6 +47,7 @@ struct ContentView: View {
 
     private enum DashboardTab: String, CaseIterable, Identifiable {
         case pipeline
+        case regen
         case punchList
 
         var id: String { rawValue }
@@ -38,6 +55,7 @@ struct ContentView: View {
         var label: String {
             switch self {
             case .pipeline: return "Pipeline"
+            case .regen: return "Regen"
             case .punchList: return "Punch List"
             }
         }
@@ -63,6 +81,9 @@ struct ContentView: View {
                 HStack(spacing: 10) {
                     Button("Scout Archive") {
                         model.openDirectory(.archive)
+                    }
+                    Button("Scout Deliverables") {
+                        model.openDirectory(.deliverables)
                     }
                     Button {
                         model.openDirectory(.input)
@@ -113,6 +134,9 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Toggle("Show Log", isOn: $isLogVisible)
+                    .toggleStyle(.checkbox)
             }
         }
     }
@@ -240,34 +264,117 @@ struct ContentView: View {
     }
 
     private var logSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Log")
-                    .font(.title3.weight(.semibold))
+        Group {
+            if isLogVisible {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Log")
+                            .font(.title3.weight(.semibold))
 
-                Spacer()
+                        Spacer()
 
-                Button("Copy Log") {
-                    let logText = model.logLines.joined(separator: "\n")
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(logText, forType: .string)
+                        Button("Copy Log") {
+                            let logText = model.logLines.joined(separator: "\n")
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(logText, forType: .string)
+                        }
+                        .disabled(model.logLines.isEmpty)
+                    }
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(model.logLines.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(.caption, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .textSelection(.enabled)
                 }
-                .disabled(model.logLines.isEmpty)
+                .padding(12)
+                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                .frame(maxHeight: .infinity)
+                }
+            }
+        }
+    }
+
+    private var regenSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Regenerate Deliverables")
+                    .font(.title3.weight(.semibold))
+                Text("Rebuild selected stamped imagery and PDFs using data stored in Scout Archive, then choose where to save the regenerated outputs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(model.logLines.enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(.caption, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Archive Session")
+                            .font(.headline)
+                        Text(model.selectedRegenSessionFolderURL?.tildePath ?? "No archive session selected")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+
+                    Spacer()
+
+                    Button("Choose Session...") {
+                        model.chooseArchiveSessionForRegeneration()
                     }
                 }
-                .textSelection(.enabled)
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Deliverables")
+                        .font(.headline)
+
+                    Toggle("Stamped Imagery", isOn: $regenStampedImagery)
+                    Toggle("Property Report PDF", isOn: $regenPropertyReport)
+                    Toggle("Flagged Comparison Report PDF", isOn: $regenFlaggedItems)
+                    Toggle("Priority Report PDF", isOn: $regenPriorityItems)
+                }
+
+                Divider()
+
+                HStack {
+                    Text(model.regenStatusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    if model.isRegenerating {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+
+                    Button("Regen Selected") {
+                        model.regenerateArchiveSession(
+                            selection: RegenerationSelection(
+                                stampedImagery: regenStampedImagery,
+                                propertyReport: regenPropertyReport,
+                                flaggedItems: regenFlaggedItems,
+                                priorityItems: regenPriorityItems
+                            )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(canRunRegeneration ? Color.blue : Color.secondary.opacity(0.18), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .foregroundStyle(canRunRegeneration ? .white : .secondary)
+                    .disabled(model.isRegenerating || !canRunRegeneration)
+                }
             }
-            .padding(12)
-            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
-            .frame(maxHeight: .infinity)
+            .padding(16)
+            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 14))
+
+            Spacer()
         }
     }
 

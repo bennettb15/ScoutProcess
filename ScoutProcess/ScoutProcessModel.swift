@@ -45,6 +45,7 @@ final class ScoutProcessModel {
         case input
         case duplicate
         case archive
+        case deliverables
         case failed
     }
 
@@ -82,7 +83,7 @@ final class ScoutProcessModel {
         }
     }
 
-    let directories: ScoutProcessDirectories
+    var directories: ScoutProcessDirectories
     var state: AppState = .idle
     var queueItems: [QueueItem] = []
     var queueRefreshID = UUID()
@@ -93,8 +94,12 @@ final class ScoutProcessModel {
     var duplicateItemCount = 0
     var failedItemCount = 0
     var isWatcherActive = false
+    var selectedRegenSessionFolderURL: URL?
+    var regenStatusMessage = "Choose an archived session to regenerate deliverables from Scout Archive."
+    var isRegenerating = false
 
-    private let controller: ScoutProcessController
+    private var controller: ScoutProcessController
+    private let regenerationService = ArchiveRegenerationService()
     private let maxLogLines = 250
     private let inputMonitorQueue = DispatchQueue(label: "com.bennett.scoutprocess.input-monitor", qos: .utility)
     private var inputDirectoryFileDescriptor: CInt = -1
@@ -111,7 +116,18 @@ final class ScoutProcessModel {
         let directories = ScoutProcessDirectories.defaultDirectories()
         self.directories = directories
         self.controller = ScoutProcessController(directories: directories)
+        configureControllerCallbacks()
+    }
 
+    var archiveLocationText: String {
+        directories.archiveRoot.tildePath
+    }
+
+    var deliverablesLocationText: String {
+        directories.deliverablesRoot.tildePath
+    }
+
+    private func configureControllerCallbacks() {
         controller.onLog = { [weak self] line in
             Task { @MainActor [weak self] in
                 self?.appendLog(line)
@@ -171,6 +187,7 @@ final class ScoutProcessModel {
         case .input: directories.input
         case .duplicate: directories.duplicate
         case .archive: directories.archiveRoot
+        case .deliverables: directories.deliverablesRoot
         case .failed: directories.failed
         }
 
@@ -192,6 +209,91 @@ final class ScoutProcessModel {
     func openQueueItemDestination(_ item: QueueItem) {
         guard let destinationURL = item.destinationURL else { return }
         NSWorkspace.shared.open(destinationURL)
+    }
+
+    func chooseArchiveLocation() {
+        guard let selectedURL = chooseDirectory(
+            title: "Choose Scout Archive Location",
+            initialDirectory: directories.archiveRoot
+        ) else {
+            return
+        }
+
+        ScoutProcessLocationSettings.setArchiveRootURL(selectedURL)
+        updateDirectories()
+        appendLog("Scout Archive location updated: \(selectedURL.tildePath)")
+    }
+
+    func chooseDeliverablesLocation() {
+        guard let selectedURL = chooseDirectory(
+            title: "Choose Scout Deliverables Location",
+            initialDirectory: directories.deliverablesRoot
+        ) else {
+            return
+        }
+
+        ScoutProcessLocationSettings.setDeliverablesRootURL(selectedURL)
+        updateDirectories()
+        appendLog("Scout Deliverables location updated: \(selectedURL.tildePath)")
+    }
+
+    func chooseArchiveSessionForRegeneration() {
+        guard let selectedURL = chooseDirectory(
+            title: "Choose Archived Session Folder",
+            initialDirectory: directories.archiveClientsRoot
+        ) else {
+            return
+        }
+
+        selectedRegenSessionFolderURL = selectedURL
+        regenStatusMessage = "Selected archive session: \(selectedURL.lastPathComponent)"
+    }
+
+    func regenerateArchiveSession(selection: RegenerationSelection) {
+        guard let selectedRegenSessionFolderURL else {
+            regenStatusMessage = "Choose an archived session folder first."
+            return
+        }
+
+        isRegenerating = true
+        regenStatusMessage = "Regenerating selected deliverables from \(selectedRegenSessionFolderURL.lastPathComponent)..."
+
+        Task {
+            do {
+                let result = try regenerationService.regenerate(
+                    archiveSessionFolderURL: selectedRegenSessionFolderURL,
+                    selection: selection
+                )
+
+                guard let destinationURL = chooseDirectory(
+                    title: "Choose Destination for Regenerated Deliverables",
+                    initialDirectory: directories.deliverablesRoot
+                ) else {
+                    try? FileManager.default.removeItem(at: result.generatedSessionFolder.deletingLastPathComponent())
+                    await MainActor.run {
+                        self.isRegenerating = false
+                        self.regenStatusMessage = "Regeneration finished, but destination selection was canceled."
+                    }
+                    return
+                }
+
+                let exportedURL = try regenerationService.export(
+                    result: result,
+                    selection: selection,
+                    destinationRootURL: destinationURL
+                )
+
+                await MainActor.run {
+                    self.isRegenerating = false
+                    self.regenStatusMessage = "Regenerated deliverables saved to \(exportedURL.tildePath)"
+                }
+            } catch {
+                await MainActor.run {
+                    self.isRegenerating = false
+                    self.regenStatusMessage = "Regeneration failed: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     func removeQueueItem(_ item: QueueItem) {
@@ -239,6 +341,39 @@ final class ScoutProcessModel {
         if logLines.count > maxLogLines {
             logLines.removeFirst(logLines.count - maxLogLines)
         }
+    }
+
+    private func chooseDirectory(title: String, initialDirectory: URL) -> URL? {
+        let panel = NSOpenPanel()
+        panel.title = title
+        panel.prompt = "Choose"
+        panel.directoryURL = initialDirectory
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        return panel.runModal() == .OK ? panel.urls.first : nil
+    }
+
+    private func updateDirectories() {
+        let wasWatcherActive = isWatcherActive
+        if wasWatcherActive {
+            stop()
+        }
+
+        directories = ScoutProcessDirectories.defaultDirectories()
+        controller = ScoutProcessController(directories: directories)
+        configureControllerCallbacks()
+
+        if wasWatcherActive {
+            start()
+        } else {
+            refreshInputItemCount()
+            refreshDuplicateItemCount()
+            refreshFailedItemCount()
+        }
+
+        queueRefreshID = UUID()
     }
 
     private func uniqueImportDestination(for fileName: String) -> URL {
@@ -545,7 +680,7 @@ final class ScoutProcessModel {
         model.lastProcessedAt = .now
         model.queueItems = [
             QueueItem(id: UUID(), fileName: "Session_A.zip", status: .processing, detail: "Generating stamped JPGs", updatedAt: .now, destinationURL: nil),
-            QueueItem(id: UUID(), fileName: "Session_B.zip", status: .done, detail: "Archived", updatedAt: .now.addingTimeInterval(-3600), destinationURL: model.directories.clientsRoot.appending(path: "ABC Property Management/12345 Buffalo Wild Wings Polaris/2026-03-02_01")),
+            QueueItem(id: UUID(), fileName: "Session_B.zip", status: .done, detail: "Archived", updatedAt: .now.addingTimeInterval(-3600), destinationURL: model.directories.deliverablesClientsRoot.appending(path: "ABC Property Management/Buffalo Wild Wings - 12345 Polaris Pkwy/2026-03-02_01")),
             QueueItem(id: UUID(), fileName: "Session_C.zip", status: .failed, detail: "session.json missing", updatedAt: .now.addingTimeInterval(-7200), destinationURL: nil)
         ]
         model.logLines = [
